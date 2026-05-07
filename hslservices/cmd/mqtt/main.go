@@ -8,239 +8,171 @@ import (
 	"os/signal"
 	"syscall"
 
-	hsl "github.com/dmw2151/hsldatabridge"
-	redis "github.com/go-redis/redis/v8"
+	fleet "github.com/dmw2151/fleetbridge"
+	redis "github.com/redis/go-redis/v9"
 	"github.com/mmcloughlin/geohash"
 	log "github.com/sirupsen/logrus"
 )
 
 var (
-	msgBroker   = hsl.NewMsgBroker(1024)
+	msgBroker   = fleet.NewMsgBroker(1024)
 	ctx, cancel = context.WithCancel(context.Background())
-	_           = hsl.InitMQTTClient(msgBroker)
-	redisClient = hsl.InitRedisClient(ctx)
-	nWorkers    = 10 // Set Variable for System CPU cap...
+	_           = fleet.InitMQTTClient(msgBroker)
+	redisClient = fleet.InitRedisClient(ctx)
+	nWorkers    = 10
 )
 
-// statJourneyID checks if a journeyID already exists in the set of previously
-// seen JourneyID; attempts to SADD. Returns True if journey exists....
-func statJourneyID(client *redis.Client, key string, journeyID string) bool {
-
-	resp, err := client.Do(
-		ctx, "SADD", key, journeyID,
-	).Result()
-
+// statTripID checks if a tripKey already has a time-series in Redis.
+// Returns true if it already exists (SADD returned 0 = element was present).
+func statTripID(client *redis.Client, key string, tripKey string) bool {
+	resp, err := client.Do(ctx, "SADD", key, tripKey).Result()
 	if err != nil {
 		return false
 	}
-
-	// If resp == 0; then already exists...
 	return resp.(int64) == 0
 }
 
-// createTimeSeriesPair - create a timeseries of events and maps it to
-// auto-update a secondary time series with a compaction rule...
-//
-// WARNING: by default this setup ONLY allows for mapping 1:1 src to target
-// event timeseries, should consider using something better to customize rules
-func createTimeSeriesPair(client *redis.Client, journeyID string, label string) {
-
-	// Initialize Creation Pipeline For a Statistic
+// createTimeSeriesPair creates a raw + aggregated time-series pair for one
+// telemetry metric (e.g. "speed" or "gh") keyed on tripKey.
+func createTimeSeriesPair(client *redis.Client, tripKey string, label string) {
 	pipe := client.TxPipeline()
 
-	// Create Parent && Child Series
+	pipe.Do(ctx, "TS.CREATE", fmt.Sprintf("positions:%s:%s", tripKey, label))
 	pipe.Do(
-		ctx, "TS.CREATE", fmt.Sprintf("positions:%s:%s", journeyID, label),
+		ctx, "TS.CREATE",
+		fmt.Sprintf("positions:%s:%s:agg", tripKey, label),
+		"RETENTION", 120*60*1000,
+		"LABELS", label, 1, "trip", tripKey,
 	)
 
-	pipe.Do(
-		ctx, "TS.CREATE", fmt.Sprintf("positions:%s:%s:agg", journeyID, label),
-		"RETENTION", 120*60*1000, "LABELS", label, 1, "journey", journeyID,
-	)
-
-	_, err := pipe.Exec(ctx)
-
-	if err != nil {
-		log.WithFields(
-			log.Fields{
-				"JourneyID":   journeyID,
-				"Series":      fmt.Sprintf("positions:%s:%s", journeyID, label),
-				"ChildSeries": fmt.Sprintf("positions:%s:%s:agg", journeyID, label),
-			},
-		).Warn("Create TimeSeries Root Series Failed: ", err)
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.WithFields(log.Fields{
+			"TripKey": tripKey,
+			"Series":  fmt.Sprintf("positions:%s:%s", tripKey, label),
+		}).Warn("TS.CREATE failed (may already exist): ", err)
 	}
 
-	// Using a second pipe, create a rule, split into 2 stages to ensure parent && child
-	// series exist first....
 	pipe.Do(
 		ctx, "TS.CREATERULE",
-		fmt.Sprintf("positions:%s:%s", journeyID, label),
-		fmt.Sprintf("positions:%s:%s:agg", journeyID, label),
+		fmt.Sprintf("positions:%s:%s", tripKey, label),
+		fmt.Sprintf("positions:%s:%s:agg", tripKey, label),
 		"AGGREGATION", "LAST", 15000,
 	)
 
-	_, err = pipe.Exec(ctx)
-
-	if err != nil {
-		log.WithFields(
-			log.Fields{
-				"JourneyID":   journeyID,
-				"Series":      fmt.Sprintf("positions:%s:%s", journeyID, label),
-				"ChildSeries": fmt.Sprintf("positions:%s:%s:agg", journeyID, label),
-			},
-		).Warn("Create TimeSeries Pair Failed: ", err)
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.WithFields(log.Fields{
+			"TripKey": tripKey,
+		}).Warn("TS.CREATERULE failed: ", err)
 	}
 }
 
-// Launch some workers here...
+// writeRedis drains the staging channel and writes each TruckEvent to Redis:
+//
+//  1. PUBLISH to "currentLocationsPS" (WebSocket dashboard fan-out)
+//  2. XADD to "events" stream (write-behind to PostGIS via RedisGears)
+//  3. TS.ADD speed and geohash time-series (last 60 s for history API)
 func writeRedis(ctx context.Context, C <-chan []byte, client *redis.Client) {
-
 	for msg := range C {
 
-		// Receive the content of the MQTT message and de-serialize bytes into
-		// struct
-		e := &hsl.EventHolder{}
-		err := hsl.DeserializeMQTTBody(msg, e)
-
-		if err != nil {
+		e := &fleet.EventHolder{}
+		if err := fleet.DeserializeMQTTBody(msg, e); err != nil {
 			switch err := err.(type) {
-			case *hsl.MQTTValidationError:
-
-				// Most common error is Missing or Bad Coords; See defn for
-				// `hsl.MQTTValidationError` for more...
-				log.WithFields(log.Fields{"Body": e}).Debug("%+v", err)
-
+			case *fleet.MQTTValidationError:
+				log.WithField("body", string(msg)).Debug("Validation: ", err)
 			default:
-				// The entry was not deserializable into a known msg types
-				// Most often an error from the source feed, e.g the feed published
-				// a route as 123 instead of "123", fail to unmarshal string into Go
-				log.WithFields(log.Fields{"Body": e}).Debug("%+v", err)
+				log.WithField("body", string(msg)).Debug("Deserialize: ", err)
 			}
-
 			continue
 		}
 
-		// Main procedure for adding a series keys, values to the redis
-		// instance
-		// MEMOIZE!!
-		journeyID := e.VP.GetEventHash()
+		v := e.VP // shorthand for the TruckEvent
+		tripKey := v.GetEventHash()
 
-		// Check if JourneyID is known...
-		journeyExists := statJourneyID(client, "journeyID", journeyID)
+		// Ensure time-series exist for this trip (idempotent after first call)
+		if !statTripID(client, "tripKeys", tripKey) {
+			log.WithFields(log.Fields{
+				"Vehicle": v.VehicleID,
+				"Trip":    v.TripID,
+				"Key":     tripKey,
+			}).Info("New trip registered — creating time-series")
 
-		// if not...then create the timeseries pair for the journey...
-		if !(journeyExists) {
-
-			log.WithFields(
-				log.Fields{
-					"JourneyID": journeyID,
-				},
-			).Info("New Journey Registered")
-
-			createTimeSeriesPair(client, journeyID, "speed")
-			createTimeSeriesPair(client, journeyID, "gh")
+			createTimeSeriesPair(client, tripKey, "speed")
+			createTimeSeriesPair(client, tripKey, "gh")
 		}
 
-		// Write The incoming event to multiple locations using
-		// a single client Tx pipeline, cuts back on some network
-		// round-trip
 		pipe := client.TxPipeline()
 
-		// 1. Publish full body...
-		pipe.Publish(
-			ctx, "currentLocationsPS", msg,
-		)
+		// 1. Pub/Sub fan-out → WebSocket dashboard
+		pipe.Publish(ctx, "currentLocationsPS", msg)
 
-		// 2. XADD the full event body to a stream of events, these
-		// are swept up by a gears function and written behind to a DB
-		// every XXXXms
-		pipe.XAdd(
-			ctx, &redis.XAddArgs{
-				Stream: "events",
-				Values: []interface{}{
-					"rt", e.VP.RouteID,
-					"jid", journeyID,
-					"lat", e.VP.Lat,
-					"lng", e.VP.Lng,
-					"time", e.VP.Timestamp,
-					"spd", e.VP.Spd,
-					"acc", e.VP.Acc,
-					"dl", e.VP.DeltaToSchedule,
-				},
+		// 2. Stream → PostGIS write-behind (RedisGears)
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: "events",
+			Values: []interface{}{
+				"vid", v.VehicleID,
+				"did", v.DriverID,
+				"tid", v.TripID,
+				"key", tripKey,
+				"lat", v.Lat,
+				"lng", v.Lng,
+				"spd", v.Speed,
+				"brg", v.Bearing,
+				"acc", v.Accuracy,
+				"ts", v.Timestamp,
+				"bat", v.Battery,
+				"src", v.Source,
 			},
-		)
+		})
 
-		// 3. TS.ADD a series of statistics to the timeseries created
-		// by `createTimeSeriesPair`
-		pipe.Do(
-			ctx,
-			"TS.ADD", fmt.Sprintf("positions:%s:speed", journeyID),
-			"*",
-			e.VP.Spd,
+		// 3. Time-series: speed (km/h) — 60 s rolling
+		pipe.Do(ctx,
+			"TS.ADD", fmt.Sprintf("positions:%s:speed", tripKey),
+			"*", v.Speed,
 			"RETENTION", 60*1000,
 			"CHUNK_SIZE", 16,
 			"ON_DUPLICATE", "LAST",
 		)
 
-		pipe.Do(
-			ctx,
-			"TS.ADD", fmt.Sprintf("positions:%s:gh", journeyID),
-			"*",
-			geohash.EncodeIntWithPrecision(e.VP.Lat, e.VP.Lng, 64),
+		// 3b. Time-series: geohash (int64) — 60 s rolling
+		pipe.Do(ctx,
+			"TS.ADD", fmt.Sprintf("positions:%s:gh", tripKey),
+			"*", geohash.EncodeIntWithPrecision(v.Lat, v.Lng, 64),
 			"RETENTION", 60*1000,
 			"ON_DUPLICATE", "LAST",
 		)
 
-		// Execute Pipe!
-		_, err = pipe.Exec(ctx)
-
-		// Failed to Write an Event
-		if err != nil {
-
-			if err, ok := err.(net.Error); ok {
-				log.Errorf("Redis Down: %+v", err)
+		if _, err := pipe.Exec(ctx); err != nil {
+			if netErr, ok := err.(net.Error); ok {
+				log.Errorf("Redis network error: %+v", netErr)
 			}
-
-			log.WithFields(
-				log.Fields{
-					"Body": fmt.Sprintf("positions:%s:*", journeyID),
-				},
-			).Errorf("Failed to Write Event: %+v", err)
-
+			log.WithField("TripKey", tripKey).Errorf("Redis pipeline failed: %+v", err)
 		} else {
-
-			log.WithFields(
-				log.Fields{"Journey": journeyID},
-			).Debug("Wrote Event")
-
+			log.WithFields(log.Fields{
+				"Vehicle": v.VehicleID,
+				"Trip":    tripKey,
+				"Speed":   v.Speed,
+			}).Debug("Event written")
 		}
 	}
 }
 
 func init() {
-	// Log as JSON instead of the default ASCII formatter.
-	log.SetFormatter(&log.TextFormatter{
-		FullTimestamp: true,
-	})
-
-	// Output to stdout instead of the default stderr
-	// Can be any io.Writer, see below for File example
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 	log.SetOutput(os.Stdout)
-
-	// Only log the warning severity or above.
-	log.SetLevel(log.WarnLevel)
+	log.SetLevel(log.WarnLevel) // Change to InfoLevel for verbose output
 }
 
 func main() {
+	defer cancel()
 
 	quitChannel := make(chan os.Signal, 1)
 
-	// Start Staging Channel -> Redis Workers
+	// Drain staging channel with N concurrent Redis writers
 	for i := 0; i < nWorkers; i++ {
 		go writeRedis(ctx, msgBroker.StagingC, redisClient)
 	}
 
 	signal.Notify(quitChannel, syscall.SIGINT, syscall.SIGTERM)
 	<-quitChannel
-
+	log.Info("Fleet Go Worker — shutting down")
 }

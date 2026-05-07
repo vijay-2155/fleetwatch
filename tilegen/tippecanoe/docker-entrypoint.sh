@@ -6,4 +6,4 @@ if [ ! -d '/tiles/statistics/' ]; then
 fi;
 
 # Start Cron && run tilegen.sh however often...
-/usr/sbin/crond -f -l 8
+/usr/sbin/cron -f -l 8

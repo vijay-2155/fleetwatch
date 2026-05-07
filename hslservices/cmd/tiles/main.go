@@ -14,7 +14,7 @@ var layerDir = os.Getenv("TILE_DIRECTORY")
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write(
-		[]byte("Good Morning, Helsinki!"),
+		[]byte("Fleet Tracker India — Tiles OK"),
 	)
 }
 

@@ -1,204 +1,672 @@
 <!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>HSL Transit</title>
-    <script src="https://unpkg.com/elm-pep"></script>
-    <style>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FleetTrack India — Live Dashboard</title>
+  <meta name="description" content="Real-time Indian truck and fleet GPS tracking dashboard powered by OpenStreetMap, Redis and MQTT.">
 
-      body { 
-        margin: 0;
-        padding: 0;
-        font-family: "Lato", sans-serif;
-      }
-    
-      hr {
-          height: 1px;
-          background-color: #ccc;
-          color: #d4e0e0;
-          border: 1px;
-          margin: 10px 20px 10px 20px; 
-      }
+  <!-- OpenLayers 8 (OSM) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@8.2.0/ol.css">
+  <script src="https://cdn.jsdelivr.net/npm/ol@8.2.0/dist/ol.js"></script>
 
-      p, h2, h3, h4 {
-        color:  #d4e0e0;
-        padding: 6px 8px 6px 16px;
-      }
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 
-      .map {
-        width: 80%;
-        height: 100%;
-      }
+  <style>
+    /* ── Reset & Base ────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-      #map {
-        right: 0px;
-        position: absolute;
-        top: 0;
-        bottom: 0;
-      }
+    :root {
+      --bg:         #0b1120;
+      --panel:      #111827;
+      --border:     #1f2d44;
+      --accent:     #f97316;        /* saffron-orange — India national colour */
+      --accent2:    #22d3ee;        /* cyan for secondary highlights */
+      --green:      #22c55e;
+      --red:        #ef4444;
+      --yellow:     #facc15;
+      --text:       #e2e8f0;
+      --muted:      #64748b;
+      --panel-r:    280px;          /* sidebar width */
+    }
 
-      /* Fixed sidenav, full height */
-      .sidenav {
-        height: 100%;
-        width: 20%;
-        position: fixed;
-        z-index: 1;
-        top: 0;
-        left: 0;
-        background-color: #111;
-        overflow-x: hidden;
-        padding-top: 20px;
-      }
+    html, body {
+      height: 100%;
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+    }
 
-      /* Style the sidenav links and the dropdown button */
-      .sidenav a, .dropdown-btn {
-        padding: 6px 8px 6px 16px;
-        text-decoration: none;
-        font-size: 20px;
-        color: #d4e0e0;
-        display: block;
-        border: none;
-        background: none;
-        width: 100%;
-        text-align: left;
-        cursor: pointer;
-        outline: none;
-      }
+    /* ── Layout ──────────────────────────────────────────────── */
+    #app {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+    }
 
-      /* On mouse-over */
-      .sidenav a:hover, .dropdown-btn:hover {
-        color: #d4e0e0;
-      }
+    /* LEFT: map */
+    #map-wrap {
+      flex: 1;
+      position: relative;
+    }
+    #map {
+      width: 100%;
+      height: 100%;
+    }
 
-      /* Dropdown container (hidden by default). Optional: add a lighter background color and some left padding to change the design of the dropdown content */
-      .dropdown-container {
-        display: none;
-        background-color: #262626;
-        padding-left: 8px;
-      }
+    /* RIGHT: sidebar */
+    #sidebar {
+      width: var(--panel-r);
+      min-width: var(--panel-r);
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
 
-      /* Optional: Style the caret down icon */
-      .fa-caret-down {
-        float: right;
-        padding-right: 8px;
-      }
+    /* ── Header ──────────────────────────────────────────────── */
+    #header {
+      padding: 18px 16px 14px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(135deg, #111827 0%, #1a253d 100%);
+      flex-shrink: 0;
+    }
+    #header .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    #header .logo-icon {
+      font-size: 1.6rem;
+      line-height: 1;
+    }
+    #header h1 {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: .02em;
+    }
+    #header .subtitle {
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-top: 1px;
+    }
 
-      /* Some media queries for responsiveness */
-      @media screen and (max-height: 450px) {
-        .sidenav {padding-top: 15px;}
-        .sidenav a {font-size: 18px;}
-      }
+    /* ── Connection Badge ────────────────────────────────────── */
+    #ws-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.72rem;
+      padding: 4px 10px;
+      border-radius: 20px;
+      width: max-content;
+      font-weight: 600;
+      transition: all .3s ease;
+    }
+    #ws-badge.online  { background: rgba(34,197,94,.15); color: var(--green); border: 1px solid rgba(34,197,94,.3); }
+    #ws-badge.offline { background: rgba(239,68,68,.15);  color: var(--red);   border: 1px solid rgba(239,68,68,.3); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .dot.pulse { animation: pulse 1.5s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: .3; }
+    }
 
-      table, td, th {  
-        border: 1px solid #0000;
-        text-align: left;
-        height: 4px;
-      }
+    /* ── Stat Cards ──────────────────────────────────────────── */
+    #stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 12px 12px 0;
+      flex-shrink: 0;
+    }
+    .stat {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .stat .label {
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+    }
+    .stat .value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #fff;
+      line-height: 1.2;
+      margin-top: 2px;
+    }
+    .stat.accent .value { color: var(--accent); }
 
-      table {
-        width: 100%;
-      }
+    /* ── Section Header ──────────────────────────────────────── */
+    .section-head {
+      padding: 12px 14px 6px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .section-head button {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 2px 8px;
+      border-radius: 5px;
+      font-size: 0.65rem;
+      cursor: pointer;
+      transition: .2s;
+    }
+    .section-head button:hover { border-color: var(--red); color: var(--red); }
 
-      tr {
-        height: 4px;
-      }
+    /* ── Event Feed ──────────────────────────────────────────── */
+    #feed {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 8px 12px;
+    }
+    #feed::-webkit-scrollbar { width: 4px; }
+    #feed::-webkit-scrollbar-track { background: transparent; }
+    #feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
-      .ol-popup {
-        position: absolute;
-        background-color: white;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.2);
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #cccccc;
-        bottom: 6px;
-        left: -50px;
-        min-width: 220px;
-      }
+    .no-events {
+      text-align: center;
+      color: var(--muted);
+      padding: 40px 20px;
+      font-size: 0.82rem;
+      line-height: 1.7;
+    }
+    .no-events .big { font-size: 2rem; margin-bottom: 8px; }
 
-      .ol-popup:after, .ol-popup:before {
-        top: 100%;
-        border: solid transparent;
-        content: " ";
-        height: 0;
-        width: 0;
-        position: absolute;
-        pointer-events: none;
-      }
+    .evt {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 10px;
+      margin-bottom: 6px;
+      font-size: 0.72rem;
+      cursor: pointer;
+      transition: border-color .15s, transform .1s;
+      animation: slideIn .2s ease;
+    }
+    @keyframes slideIn { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+    .evt:hover { border-color: var(--accent); transform: translateX(2px); }
+    .evt.selected { border-color: var(--accent2); background: rgba(34,211,238,.04); }
+    .evt.flash { border-color: var(--accent); background: rgba(249,115,22,.06); }
 
-      .dropdown-container {
-        display: none;
-        background-color: #262626;
-        padding-left: 8px;
-      }
+    .evt-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 5px;
+    }
+    .vid {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .time { color: var(--muted); font-size: 0.65rem; }
 
-      /* Add an active class to the active dropdown button */
-      .active {
-        background-color: #672044;
-        color: white;
-      }
+    .evt-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip {
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: #1a253d;
+      border: 1px solid var(--border);
+      font-size: 0.66rem;
+    }
+    .chip .k { color: var(--muted); }
+    .chip .v { color: #fff; font-weight: 600; margin-left: 2px; }
+    .chip.spd-hi .v  { color: var(--red); }
+    .chip.spd-mid .v { color: var(--yellow); }
+    .chip.spd-ok .v  { color: var(--green); }
 
-    </style>
-  </head>
-  <body>
+    /* ── Map controls bar (top of map) ──────────────────────── */
+    #map-bar {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+    }
+    .map-btn {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 0.75rem;
+      font-family: 'Inter', sans-serif;
+      cursor: pointer;
+      transition: .2s;
+      font-weight: 500;
+    }
+    .map-btn:hover  { border-color: var(--accent); color: var(--accent); }
+    .map-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
-    <div id="layerbar" class="sidenav">
-        <h2>Live Helsinki Regional Transport Tracking</h2>
-        <hr>
-        <h3>Layers</h3>
-        <a id="live-toggle">Live Layers</a>
-        <a id='areas-stats-toggle'>Neighborhood Layers</a>
-        <button class="dropdown-btn">GTFS Layers</button>
-        <div class="dropdown-container">
-            <a id='stops-toggle' class=layer-toggle>Stops</a>
-            <a id='routes-toggle' class=layer-toggle>Routes</a>
+    /* ── Popup ───────────────────────────────────────────────── */
+    #popup {
+      position: absolute;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 210px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.6);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(-4px);
+      transition: opacity .2s, transform .2s;
+    }
+    #popup.visible { opacity: 1; transform: none; pointer-events: auto; }
+    #popup h4 {
+      font-size: 0.8rem;
+      color: var(--accent);
+      margin-bottom: 8px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    #popup table { width: 100%; border-collapse: collapse; }
+    #popup td {
+      font-size: 0.7rem;
+      padding: 2px 0;
+      color: var(--muted);
+    }
+    #popup td:last-child { color: var(--text); text-align: right; font-weight: 600; }
+    #popup-close {
+      position: absolute;
+      top: 8px; right: 10px;
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 1rem;
+      pointer-events: auto;
+    }
+    #popup-close:hover { color: var(--red); }
+
+    /* ── Bottom attribution fix ──────────────────────────────── */
+    .ol-attribution { font-size: 0.6rem !important; }
+  </style>
+</head>
+<body>
+
+<div id="app">
+  <!-- ░░░ MAP ░░░ -->
+  <div id="map-wrap">
+    <div id="map"></div>
+
+    <div id="map-bar">
+      <button class="map-btn active" id="btn-live" onclick="toggleLive()">📡 Live</button>
+      <button class="map-btn" id="btn-trail" onclick="toggleTrail()">🛤 Trail</button>
+      <button class="map-btn" id="btn-india" onclick="flyToIndia()">🇮🇳 India</button>
+    </div>
+
+    <!-- Popup -->
+    <div id="popup">
+      <span id="popup-close" onclick="closePopup()">✕</span>
+      <h4 id="popup-vid">—</h4>
+      <table id="popup-table"></table>
+    </div>
+  </div>
+
+  <!-- ░░░ SIDEBAR ░░░ -->
+  <div id="sidebar">
+    <div id="header">
+      <div class="brand">
+        <span class="logo-icon">🚛</span>
+        <div>
+          <h1>FleetTrack India</h1>
+          <div class="subtitle">Real-time GPS — powered by OSM</div>
         </div>
-        <hr>
-        <h3>Instructions</h3>
-        <p>The buttons above control the layers displayed on the map. You can hover over any layer feature for more detail</p>
-        
-        <h4>Live</h4> 
-          <p>The live layer displays the current position of any bus, train, or tram in the HSL metro area. 
-            Clicking on a vehicle in this layer will render the past 2 hours of the vehicle's position and 
-            speed history.
-        </p>
-
-        <h4>Neighborhood</h4>
-        <p>The neighborhood layer divides the metro area into neighborhoods and renders them 
-          as shapes on the map, the coloring of the map represents the average speed of 
-          vehicles in area in the previous 60 minutes.
-        </p>
-        
-        <h4>GTFS</h4> 
-        <p>The GTFS layer displays the reported stop locations and routes in the metro system.</p>
-        <hr>
-        <p><span id="datetime"></span></p>
+      </div>
+      <div id="ws-badge" class="offline">
+        <span class="dot" id="ws-dot"></span>
+        <span id="ws-label">Connecting…</span>
+      </div>
     </div>
 
-    <div id="map" class="map"></div>
-    <div id="popup" class="ol-popup">
-      <a href="#" id="popup-closer" class="ol-popup-closer"></a>
-      <div id="popup-content"></div>
+    <div id="stats">
+      <div class="stat accent">
+        <div class="label">Events</div>
+        <div class="value" id="stat-events">0</div>
+      </div>
+      <div class="stat">
+        <div class="label">Vehicles</div>
+        <div class="value" id="stat-vehicles">0</div>
+      </div>
+      <div class="stat">
+        <div class="label">Last VID</div>
+        <div class="value" id="stat-vid" style="font-size:.9rem;margin-top:6px">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Speed</div>
+        <div class="value" id="stat-speed">— <span style="font-size:.9rem;color:var(--muted)">km/h</span></div>
+      </div>
     </div>
 
-    <script src="./index.js"></script>
+    <div class="section-head">
+      Live Feed
+      <button onclick="clearFeed()">Clear</button>
+    </div>
 
-    <script>
-      /* Loop through all dropdown buttons to toggle between hiding and showing its dropdown content - This allows the user to have multiple dropdowns without any conflict */
-      var dropdown = document.getElementsByClassName("dropdown-btn");
-      var i;
-      
-      for (i = 0; i < dropdown.length; i++) {
-        dropdown[i].addEventListener("click", function() {
-            this.classList.toggle("active");
-            var dropdownContent = this.nextElementSibling;
-            if (dropdownContent.style.display === "block") {
-            dropdownContent.style.display = "none";
-            } else {
-            dropdownContent.style.display = "block";
-            }
-            });
-      }
-    </script>
+    <div id="feed">
+      <div class="no-events" id="no-events">
+        <div class="big">📭</div>
+        Waiting for telemetry…<br>
+        <small>Start a trip in the Flutter app</small>
+      </div>
+    </div>
+  </div>
+</div>
 
-  </body>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const API_HOST = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+  ? window.location.host   // dev: same origin
+  : window.location.host;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let totalEvents = 0;
+const vehicles  = new Map();   // vid → last TruckEvent
+const trailPts  = [];          // [{lat,lng,vid}] last 200 trail points
+let   ws        = null;
+let   liveOn    = true;
+let   trailOn   = false;
+
+// ── OpenLayers Map ────────────────────────────────────────────────────────────
+const osmLayer = new ol.layer.Tile({
+  source: new ol.source.XYZ({
+    // OpenStreetMap tiles (free, open-source, no API key)
+    url: 'https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attributions: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19,
+  })
+});
+
+// Live vehicle dots
+const liveSource = new ol.source.Vector();
+const liveLayer  = new ol.layer.Vector({
+  source: liveSource,
+  style: vehicleStyle,
+});
+
+// Trail (breadcrumb) layer
+const trailSource = new ol.source.Vector();
+const trailLayer  = new ol.layer.Vector({
+  source: trailSource,
+  visible: false,
+  style: trailStyle,
+});
+
+function vehicleStyle(feature) {
+  const spd = feature.get('spd') || 0;
+  let clr = '#22c55e';                         // green = slow/parked
+  if (spd > 80) clr = '#ef4444';              // red   = fast
+  else if (spd > 40) clr = '#facc15';         // yellow= medium
+
+  return new ol.style.Style({
+    image: new ol.style.Circle({
+      radius: 8,
+      fill:   new ol.style.Fill({ color: clr }),
+      stroke: new ol.style.Stroke({ color: '#fff', width: 2 }),
+    }),
+    text: new ol.style.Text({
+      text: feature.get('vid') || '',
+      font: '600 10px Inter, sans-serif',
+      fill: new ol.style.Fill({ color: '#fff' }),
+      offsetY: -16,
+      backgroundFill: new ol.style.Fill({ color: 'rgba(11,17,32,.75)' }),
+      padding: [2, 4, 2, 4],
+    }),
+  });
+}
+
+function trailStyle() {
+  return new ol.style.Style({
+    image: new ol.style.Circle({
+      radius: 3,
+      fill:   new ol.style.Fill({ color: 'rgba(249,115,22,.6)' }),
+    })
+  });
+}
+
+const map = new ol.Map({
+  target: 'map',
+  layers: [osmLayer, trailLayer, liveLayer],
+  view: new ol.View({
+    // Default: centre of India
+    center: ol.proj.fromLonLat([78.9629, 20.5937]),
+    zoom: 5,
+  }),
+  controls: ol.control.defaults.defaults().extend([
+    new ol.control.ScaleLine({ units: 'metric' })
+  ]),
+});
+
+// ── Popup on vehicle click ────────────────────────────────────────────────────
+const popup = document.getElementById('popup');
+
+map.on('click', (evt) => {
+  let hit = false;
+  map.forEachFeatureAtPixel(evt.pixel, (feature) => {
+    if (feature.get('vid')) {
+      showPopup(evt.coordinate, feature.getProperties());
+      hit = true;
+      return true;
+    }
+  }, { hitTolerance: 6 });
+  if (!hit) closePopup();
+});
+
+map.on('pointermove', (evt) => {
+  const px = map.getEventPixel(evt.originalEvent);
+  const hit = map.hasFeatureAtPixel(px, { hitTolerance: 6 });
+  map.getTargetElement().style.cursor = hit ? 'pointer' : '';
+});
+
+function showPopup(coord, props) {
+  const el = document.getElementById('popup-vid');
+  const tb = document.getElementById('popup-table');
+  el.textContent = props.vid || '—';
+
+  const fields = [
+    ['Driver', props.did],
+    ['Speed',  `${(props.spd||0).toFixed(1)} km/h`],
+    ['Bearing',`${(props.brg||0).toFixed(0)}°`],
+    ['Accuracy',`±${(props.acc||0).toFixed(0)} m`],
+    ['Battery', `${props.bat ?? '?'}%`],
+    ['Lat',    (props.lat||0).toFixed(6)],
+    ['Lng',    (props.lng||0).toFixed(6)],
+    ['Trip',   (props.tid||'').slice(0,8) + '…'],
+  ];
+
+  tb.innerHTML = fields.map(([k,v]) =>
+    `<tr><td>${k}</td><td>${v}</td></tr>`
+  ).join('');
+
+  // Position popup near feature
+  const px = map.getPixelFromCoordinate(coord);
+  popup.style.left = (px[0] + 14) + 'px';
+  popup.style.top  = (px[1] - 10) + 'px';
+  popup.classList.add('visible');
+}
+function closePopup() { popup.classList.remove('visible'); }
+
+// ── Map control buttons ───────────────────────────────────────────────────────
+function toggleLive() {
+  liveOn = !liveOn;
+  liveLayer.setVisible(liveOn);
+  document.getElementById('btn-live').classList.toggle('active', liveOn);
+}
+
+function toggleTrail() {
+  trailOn = !trailOn;
+  trailLayer.setVisible(trailOn);
+  document.getElementById('btn-trail').classList.toggle('active', trailOn);
+}
+
+function flyToIndia() {
+  map.getView().animate({
+    center: ol.proj.fromLonLat([78.9629, 20.5937]),
+    zoom: 5, duration: 800,
+  });
+}
+
+// ── WebSocket → Live positions ────────────────────────────────────────────────
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${API_HOST}/locations/`);
+
+  ws.onopen = () => {
+    setBadge(true);
+    console.log('WS connected');
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const raw = JSON.parse(e.data);
+      // Go worker publishes the raw TruckEvent JSON
+      const ev  = raw.VP ?? raw;   // support both wrapped and direct
+      onEvent(ev);
+    } catch (err) {
+      console.warn('WS parse error', err);
+    }
+  };
+
+  ws.onclose = ws.onerror = () => {
+    setBadge(false);
+    setTimeout(connectWS, 3000);
+  };
+}
+
+function onEvent(ev) {
+  if (!ev || !ev.lat || !ev.lng) return;
+
+  totalEvents++;
+
+  // Update stats
+  vehicles.set(ev.vid, ev);
+  document.getElementById('stat-events').textContent   = totalEvents;
+  document.getElementById('stat-vehicles').textContent = vehicles.size;
+  document.getElementById('stat-vid').textContent      = ev.vid || '—';
+  document.getElementById('stat-speed').innerHTML =
+    `${(ev.spd||0).toFixed(1)} <span style="font-size:.9rem;color:var(--muted)">km/h</span>`;
+
+  // Move/add map feature
+  const coord = ol.proj.fromLonLat([ev.lng, ev.lat]);
+  let feat = liveSource.getFeatureById(ev.vid);
+  if (feat) {
+    feat.getGeometry().setCoordinates(coord);
+    feat.setProperties(ev);
+  } else {
+    feat = new ol.Feature({ geometry: new ol.geom.Point(coord) });
+    feat.setId(ev.vid);
+    feat.setProperties(ev);
+    liveSource.addFeature(feat);
+  }
+
+  // Trail breadcrumb
+  trailPts.push(ev);
+  if (trailPts.length > 200) trailPts.shift();
+  const trailFeat = new ol.Feature({ geometry: new ol.geom.Point(coord) });
+  trailSource.addFeature(trailFeat);
+  if (trailSource.getFeatures().length > 200) {
+    trailSource.removeFeature(trailSource.getFeatures()[0]);
+  }
+
+  // Auto-pan to first vehicle
+  if (totalEvents === 1) {
+    map.getView().animate({ center: coord, zoom: 14, duration: 800 });
+  }
+
+  addFeedRow(ev);
+}
+
+// ── Event feed (sidebar) ──────────────────────────────────────────────────────
+function addFeedRow(ev) {
+  const feed = document.getElementById('feed');
+  const noMsg = document.getElementById('no-events');
+  if (noMsg) noMsg.remove();
+
+  const spd = ev.spd || 0;
+  const spdClass = spd > 80 ? 'spd-hi' : spd > 40 ? 'spd-mid' : 'spd-ok';
+
+  const now = new Date();
+  const timeStr = now.toTimeString().slice(0,8);
+
+  const row = document.createElement('div');
+  row.className = 'evt';
+  row.innerHTML = `
+    <div class="evt-top">
+      <span class="vid">🚛 ${ev.vid || '?'}</span>
+      <span class="time">${timeStr}</span>
+    </div>
+    <div class="evt-chips">
+      <div class="chip"><span class="k">lat</span><span class="v">${(ev.lat||0).toFixed(4)}</span></div>
+      <div class="chip"><span class="k">lng</span><span class="v">${(ev.lng||0).toFixed(4)}</span></div>
+      <div class="chip ${spdClass}"><span class="k">spd</span><span class="v">${spd.toFixed(1)}</span></div>
+      <div class="chip"><span class="k">acc</span><span class="v">±${(ev.acc||0).toFixed(0)}m</span></div>
+      <div class="chip"><span class="k">bat</span><span class="v">${ev.bat ?? '?'}%</span></div>
+    </div>`;
+
+  // Click to pan
+  row.addEventListener('click', () => {
+    const coord = ol.proj.fromLonLat([ev.lng, ev.lat]);
+    map.getView().animate({ center: coord, zoom: 15, duration: 600 });
+    // highlight briefly
+    document.querySelectorAll('.evt.selected').forEach(r => r.classList.remove('selected'));
+    row.classList.add('selected');
+  });
+
+  feed.insertBefore(row, feed.firstChild);
+
+  // Flash
+  row.classList.add('flash');
+  setTimeout(() => row.classList.remove('flash'), 600);
+
+  // DOM cap
+  while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+}
+
+function clearFeed() {
+  const feed = document.getElementById('feed');
+  feed.innerHTML = '<div class="no-events" id="no-events"><div class="big">📭</div>Cleared</div>';
+  totalEvents = 0;
+  vehicles.clear();
+  trailSource.clear();
+  liveSource.clear();
+  document.getElementById('stat-events').textContent   = '0';
+  document.getElementById('stat-vehicles').textContent = '0';
+  document.getElementById('stat-vid').textContent      = '—';
+  document.getElementById('stat-speed').innerHTML      = '— <span style="font-size:.9rem;color:var(--muted)">km/h</span>';
+}
+
+// ── Badge ─────────────────────────────────────────────────────────────────────
+function setBadge(online) {
+  const b  = document.getElementById('ws-badge');
+  const d  = document.getElementById('ws-dot');
+  const lb = document.getElementById('ws-label');
+  b.className  = 'online' in b.classList ? '' : '';
+  b.className  = online ? 'online' : 'offline';
+  d.className  = online ? 'dot pulse' : 'dot';
+  lb.textContent = online ? 'Live' : 'Reconnecting…';
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+connectWS();
+</script>
+</body>
 </html>

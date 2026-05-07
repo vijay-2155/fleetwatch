@@ -1,22 +1,31 @@
-FROM osgeo/gdal:alpine-small-3.6.3
+FROM osgeo/gdal:ubuntu-small-3.6.3
 
-# Add PostgreSQL Client Binary
-RUN apk add postgresql-client
- 
-# Add Tippecanoe Binary, sourced from: https://github.com/jskeates/docker-tippecanoe/blob/master/Dockerfile
+# The base image already has ogr2ogr/GDAL. Add PostgreSQL client + build tools.
+# osgeo/gdal:ubuntu-small-3.6.3 is based on Ubuntu 22.04 (Jammy) — apt repos are active.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        postgresql-client \
+        wget \
+        unzip \
+        cron \
+        git \
+        g++ \
+        make \
+        libsqlite3-dev \
+        zlib1g-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build Tippecanoe 1.36.0 from original mapbox source (no pmtiles, compiles cleanly)
 ARG TIPPECANOE_RELEASE="1.36.0"
 
-RUN apk add --no-cache git g++ make libgcc libstdc++ sqlite-libs sqlite-dev zlib-dev bash \
-    && cd /root \
-    && git clone https://github.com/mapbox/tippecanoe.git tippecanoe \
+RUN cd /root \
+    && git clone --depth=1 --branch ${TIPPECANOE_RELEASE} https://github.com/mapbox/tippecanoe.git tippecanoe \
     && cd tippecanoe \
-    && git checkout tags/$TIPPECANOE_RELEASE \
-    && cd /root/tippecanoe \
-    && make \
+    && make -j$(nproc) \
     && make install \
     && cd /root \
-    && rm -rf /root/tippecanoe \
-    && apk del git g++ make sqlite-dev
+    && rm -rf /root/tippecanoe
 
 COPY ./tippecanoe /
 

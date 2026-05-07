@@ -1,18 +1,21 @@
-FROM node:15.14.0-alpine3.10
+# syntax=docker/dockerfile:1.7
+# Fleet Tracker — Dashboard (static HTML served by nginx)
+# The new frontend uses OpenLayers via CDN — no npm build needed.
+# ── Stage 1: nothing to build (pure HTML/CSS/JS, no bundler) ─────────────────
+FROM nginx:1.27-alpine
 
-RUN mkdir -p hslolfrontend 
+LABEL org.opencontainers.image.title="Fleet Dashboard"
+LABEL org.opencontainers.image.description="OpenStreetMap live tracking dashboard."
 
-COPY ./ /hslolfrontend
+# Remove default nginx page
+RUN rm -rf /usr/share/nginx/html/*
 
-RUN cd /hslolfrontend &&\
-    npm install ol && \
-    npm install --save-dev parcel-bundler &&\
-    npm run build
+# Copy dashboard
+COPY ./index.html /usr/share/nginx/html/index.html
 
-RUN apk update && \
-    apk add mailcap && \
-    rm /var/cache/apk/*
+# Minimal nginx config: serve on :8080, proxy /locations/ and /histlocations/
+# to the locations_api service
+COPY ./nginx.conf /etc/nginx/conf.d/default.conf
 
-WORKDIR ./hslolfrontend/dist
-
-ENTRYPOINT ["/usr/local/bin/npm", "start"]
+EXPOSE 8080
+CMD ["nginx", "-g", "daemon off;"]

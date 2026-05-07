@@ -1,337 +1,188 @@
-# Helsinki Transit System - Real-Time Vehicle Tracking with Redis
+# 🚛 FleetTrack India — Real-Time Truck & Fleet Tracking
 
-This project publishes realtime locations of municipal transport vehicles in the Helsinki metro area to a web UI. Although Helsinki offers a great [realtime API](https://digitransit.fi/en/developers/apis/4-realtime-api/vehicle-positions/) for developers, there is no such site that makes this data generally available to the public.<sup>1</sup>
+Production-grade GPS tracking platform for Indian logistics fleets.  
+**Driver Flutter app → Mosquitto MQTT → Go worker → Redis Stack → PostGIS → OpenStreetMap dashboard**
 
-This is an awesome service that Helsinki provides. Given that HSL publishes on the order of ~50 million updates per day, I felt that Redis would be a great tool to use given the robustness of the TimeSeries Module to quickly aggregate tens of thousands of datapoints, and the Redis Gears module's ability to run batch jobs off the main thread.
+---
 
+## Architecture
 
+```
+[Driver Phone]
+  Flutter App (Android Foreground Service)
+  GPS → SQLite offline buffer → MQTT QoS 1
+             ↓
+  [Mosquitto Broker]  port 1883  (our own)
+             ↓
+  [Go Worker]  (hslservices/cmd/mqtt)
+             ↓
+  Redis Pipeline: PUBLISH + XADD + TS.ADD
+             ↓
+  PostGIS  (write-behind via RedisGears / Triggers & Functions)
+             ↓
+  WebSocket → Live OpenStreetMap Dashboard
+```
 
-![Screenshot of Live Map - Downtown Helsinki](https://raw.githubusercontent.com/DMW2151/expert-garbanzo/master/docs/live_.png "live")
+---
 
-UI with **GTFS** (black) and **live-location** (blue) layers enabled.
+## Quick Start
 
-![Screenshot of Live Map - Neighborhoods](https://raw.githubusercontent.com/DMW2151/expert-garbanzo/master/docs/areas.png "areas")
+### Prerequisites
+- Docker + Docker Compose v2
+- Android phone on same Wi-Fi as server (for live test)
 
-UI with the **current traffic** layer enabled - an hourly summary is aggregated to the neighborhood level and then colored based on vehicle speed in the area.
+### 1. Configure your LAN IP
 
-![Screenshot of Live Map - History of Single Vehicle](https://raw.githubusercontent.com/DMW2151/expert-garbanzo/master/docs/Single.png "single")
+```dart
+// driver_app/lib/config.dart
+static const mqttHost = '192.168.x.x';   // ← your machine's LAN IP
+```
 
-UI with the **trip history** layer and tooltip showing details of vehicle's current status. Coloring maps to vehicle's contemporaneous speed.
-
--------
-
-- [Helsinki Transit System - Real-Time Vehicle Tracking with Redis](#Helsinki-Transit-System---Real-Time-Vehicle-Tracking-with-Redis)
-  - [Summary](#Summary)
-  - [Local Build - Startup Notes](#Local-Build---Startup-Notes)
-  - [System Architecture](#System-Architecture)
-    - [Ingesting Data w. MQTT to Redis Broker](#Ingesting-Data-w-MQTT-to-Redis-Broker)
-      - [Writing Data to PubSub Channel](#Writing-Data-to-PubSub-Channel)
-      - [Writing Data to Event Stream](#Writing-Data-to-Event-Stream)
-      - [Writing Data to TimeSeries](#Writing-Data-to-TimeSeries)
-        - [Commands](#Commands)
-    - [Redis Gears](#Redis-Gears)
-    - [Tile Generation Pipeline (PostGIS)](#Tile-Generation-Pipeline-PostGIS)
-    - [Accessing Data with the Locations API](#Accessing-Data-with-the-Locations-API)
-      - [Commands](#Commands-1)
-    - [Frontend](#Frontend)
-  - [Technical Appendix](#Technical-Appendix)
-    - [Data Throughput](#Data-Throughput)
-    - [Memory, CPU, and Disk Usage](#Memory-CPU-and-Disk-Usage)
-  
-_______
-
-## Summary
-
-Data is sourced from the Helsinki Regional Transit Authority via a public [MQTT feed](https://digitransit.fi/en/developers/apis/4-realtime-api/vehicle-positions/). Incoming MQTT messages are processed through a [custom MQTT broker](./hslservices/cmd/mqtt/main.go) that pushes them to Redis.
-
-MQTT messages are delivered in 2 parts, message topic and message body. Consider the example message below for demonstrations sake:
+### 2. Start backend services
 
 ```bash
-# Topic - Delivered as Msg Part 1
-/hfp/v2/journey/ongoing/vp/bus/0018/00423/2159/2/Matinkylä (M)/09:32/2442201/3/60;24/16/58/67
+docker compose up -d
+```
 
-# Body - Delivered as Msg Part 2
+| Service | Port | Description |
+|---|---|---|
+| **Mosquitto** | 1883 | MQTT broker (driver phones connect here) |
+| **Redis Stack** | 6379 | TimeSeries, Streams, Pub/Sub |
+| **Go Worker** | — | MQTT → Redis bridge |
+| **Locations API** | 2152 | WebSocket fan-out + trip history |
+| **PostGIS** | 5433 | Write-behind GPS event log |
+| **Dashboard** | 8080 | Live OpenStreetMap map |
+
+### 3. Run the Flutter driver app
+
+```bash
+cd driver_app
+flutter run --release   # or install APK on a real Android device
+```
+
+### 4. Open the dashboard
+
+```
+http://localhost:8080
+```
+
+---
+
+## Payload Format (compact keys → saves bytes on 2G/3G)
+
+```json
 {
-  "VP": {
-    "desi": "159",
-    "dir": "2",
-    "oper": 6,
-    "veh": 423,
-    "tst": "2021-05-15T06:40:28.629Z",
-    "tsi": 1621060828,
-    "spd": 21.71,
-    "hdg": 67,
-    "lat": 60.156949,
-    "long": 24.687111,
-    "acc": 0,
-    "dl": -21,
-    "odo": null,
-    "drst": null,
-    "oday": "2021-05-15",
-    "jrn": 202,
-    "line": 1062,
-    "start": "09:32",
-    "loc": "GPS",
-    "stop": null,
-    "route": "2159",
-    "occu": 0
-  }
+  "vid": "AP 30 Y 1828",
+  "did": "9505683966",
+  "tid": "uuid-trip-id",
+  "lat": 17.7137197,
+  "lng": 83.1691558,
+  "spd": 0.30,
+  "brg": 0.0,
+  "acc": 5.10,
+  "ts":  1778132507,
+  "bat": 82,
+  "src": "mobile"
 }
 ```
 
-Once in Redis, the data is fanned out to a stream, a pub/sub channel, and multiple time series.
+---
 
-1. Event data sent to a stream is processed with a Redis Gears function and written to persistent storage (PostgreSQL). Once in PostgreSQL, this data is processed hourly and used to generate MapBox tiles for the **current traffic** layer.
+## Flutter App Features
 
-2. Event data sent to the PUB/SUB channel is forwarded to each connected client via websocket. This allows for live updates of positions in the browser on the **live-location** layer.
+| Feature | Implementation |
+|---|---|
+| **Android Foreground Service** | GPS stays alive with screen off |
+| **Adaptive GPS rate** | 5 s moving · 60 s parked (saves ~80% battery) |
+| **SQLite offline buffer** | Zero data loss during highway signal blackouts |
+| **QoS 1 MQTT** | Broker ACKs every delivery |
+| **±50 m accuracy filter** | Discards tunnel / bad-fix readings |
+| **Auto-boot resume** | Restarts tracking after phone reboot |
+| **Buffer flush on reconnect** | Replays offline events when signal returns |
 
-3. Time series data is split into separate series for for position (geohash, represented as int) and speed for each scheduled trip. These timeseries are then compacted and served to the frontend by a Golang API which allows the user to access a **trip history** layer.
+---
 
-The remainder of this document will go through the application in a bit more detail, including local deployment of the application, Redis commands used in each stage & system traffic and architecture.
+## Project Structure
 
---------
-
-## Local Build - Startup Notes
-
-A functional version of the system can be spun up locally with `docker-compose`. This will spin up (almost) all services required to run a local demo in their own isolated environments. The service will be running on http://localhost:8080/.
-
-```bash
-docker-compose up --build
+```
+.
+├── driver_app/          # Flutter Android driver app
+│   └── lib/
+│       ├── config.dart               # Broker IP · GPS intervals
+│       ├── main.dart                 # App entry + dark theme
+│       ├── models/truck_event.dart   # Payload struct
+│       ├── services/
+│       │   ├── tracking_service.dart # Android Foreground Service ⭐
+│       │   ├── mqtt_service.dart     # MQTT client (QoS 1, auto-reconnect)
+│       │   └── offline_buffer.dart   # SQLite offline queue
+│       ├── providers/tracking_provider.dart
+│       └── screens/
+│           ├── home_screen.dart      # Speedometer · status · SOS
+│           └── trip_setup_screen.dart
+│
+├── hslservices/         # Go backend (renamed package: fleetbridge)
+│   ├── event.go         # TruckEvent struct
+│   ├── mqttClient.go    # Mosquitto subscriber
+│   ├── redisClient.go   # Redis Stack client (v9)
+│   ├── errors.go
+│   └── cmd/
+│       ├── mqtt/        # MQTT → Redis worker
+│       ├── locations/   # WebSocket + history API
+│       └── tiles/       # Static tile server
+│
+├── frontend/            # Live map dashboard
+│   ├── index.html       # OpenStreetMap (OpenLayers 8, CDN, no API key)
+│   ├── nginx.conf       # Proxy WS + tiles to Go services
+│   └── Dockerfile       # nginx:1.27-alpine (no npm build needed)
+│
+├── mosquitto/           # Mosquitto broker config
+│   └── mosquitto.conf
+│
+├── redis/               # Redis Stack 7.4 image + Gears scripts
+├── postgis/             # PostGIS init SQL
+├── tilegen/             # Tippecanoe tile generator (India districts)
+├── envs/                # Environment variable files
+└── docker-compose.yml
 ```
 
-The following command can be run if you're interested in receiving periodic updates to the traffic speeds/neighborhoods layer. This is not strictly necessary as it can take several hours to gather sufficient data to get a reasonable amount of data (and you'd still need to wait to the `tilegen` job to come around to repopulate layers).
+---
 
-```bash
-docker exec <name of redis container> \ # (e.g. redis_hackathon_redis_1)
-    bash -c "gears-cli run /redis/stream_writebehind.py --requirements /redis/requirements.txt"
+## Environment Variables
+
+### `envs/mqtt_connector.env`
+```env
+MQTT_TOPIC=trucks/#
+MQTT_BROKER=mosquitto
+MQTT_PORT=1883
+MQTT_N_WORKERS=10
 ```
 
-------
-## Deployement Notes
-
-The whole system `docker-compose` setup is currently running without security and traffic is routed via ports. If you want to deploy to a cloud instance and secure the installation, then the most easy way would be to add a reverse proxy (e.g. nginx) to the `docker-compose` setup to route via URL pathes and modify the hard-coded ports in `./frontend/index.js` to mach your pathes. If you want to add SSL, then the protocols need to be changed from `HTTP/WS` to `HTTPS/WSS` as well.
-
-------
-
-## System Architecture
-
-All components of the app are hosted on single AWS `t3.medium` with a `gp3` EBS volume. In retrospect, while the `t3.medium` is appealing because of burstable CPU, a smaller instance could handle the application in it's current state.
-
-![Arch](https://raw.githubusercontent.com/DMW2151/expert-garbanzo/master/docs/arch.jpg "arch")
-
-### Ingesting Data w. MQTT to Redis Broker
-
-The MQTT broker is a Golang service that subscribes to a MQTT feed provided by the Helsinki Transit Authority. This service pushes MQTT message data to Redis after processing the message. More about the real-time positioning data from the HSL Metro can be found [here](https://digitransit.fi/en/developers/apis/4-realtime-api/vehicle-positions/). The broker is responsible for writing an incoming message from the MQTT feed to each of the following locations:
-
-#### Writing Data to PubSub Channel
-
-The incoming event is published to a PUB/SUB channel in Redis. This component (the mqtt broker) uses Golang as a Redis client and uses the code/command below.
-
-```golang
-// In Golang...
-pipe := client.TxPipeline()
-ctx := client.Context()
-
-// Stylizing the Actual Message Body for Readme
-msg := &hsl.EventHolder{
-    "acc": 0.1, "speed": 10.6, "route": "foo"
-}
-
-pipe.Publish(
-    ctx, "currentLocationsPS", msg
-)
+### `envs/redis.env`
+```env
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_DB=0
 ```
 
-```bash
-# Using a standard Redis client...
-127.0.0.1:6379>  PUBLISH currentLocationsPS '{"acc": 0.1, "speed": 10.6, "route": "foo"}'
-```
+## Tech Stack
 
-#### Writing Data to Event Stream
+| Layer | Technology |
+|---|---|
+| Driver app | Flutter 3, Android Foreground Service, SQLite |
+| MQTT broker | Eclipse Mosquitto 2 |
+| Go worker | Go 1.22, paho.mqtt v1.5, redis/go-redis v9 |
+| Cache & streams | Redis Stack 7.4 (TimeSeries, Pub/Sub, Streams) |
+| Write-behind DB | PostGIS 16-3.5 |
+| Geofence tiles | tippecanoe + GADM India boundaries |
+| Map | OpenLayers 8 + OpenStreetMap (no API key) |
+| Dashboard server | nginx 1.27 |
 
-The incoming event is pushed to a stream. This stream is later cleared and processed by code that runs via [Redis Gears](./redis/stream_writebehind.py). As with the PUB/SUB channel, this is written using the Redis Go Client shown below.
+---
 
-```golang
-// In Golang...
-pipe.XAdd(
-    ctx, &redis.XAddArgs{
-        Stream: "events",
-        Values: []interface{}{
-            "jid", journeyID,
-            "lat", e.VP.Lat,
-            "lng", e.VP.Lng,
-            "time", e.VP.Timestamp,
-            "spd", e.VP.Spd,
-            "acc", e.VP.Acc,
-            "dl", e.VP.DeltaToSchedule,
-        },
-    },
-)
-```
+## Security Roadmap
 
-```bash
-# Using a standard Redis client...
-127.0.0.1:6379>  XADD events * jid journeyhashID lat 60 lng 25 time 1620533624765 speed 10 acc 0.1 dl "00:00"
-```
-
-#### Writing Data to TimeSeries
-
-The incoming event is pushed to several time series. A unique identifier is created for each "trip" (referred to as **JourneyHash**) hashing certain attributes from the event. The broker creates a time series for both speed and location for each journeyhash. 
-
-- Location data is stored in a time series by encoding a (lat, lng) position to an integer representation (much like Redis does internally for `GEO.XXX` commands).
-  
-- Speed data is simply stored as m/s, as it appears in the original MQTT message.
-
-The position and speed series have a short retention and are compacted to secondary time series. These compacted series have a much longer retention time (~2hr) and are used by the API to show users the **trip history** layer. By quickly expiring/aggregating individual events, this pattern allows us to keep memory usage much lower.
-
-##### Commands
-
-As with previous sections, the commands are executed by Golang. As the standard Golang client does not include the `TS.XXX` commands, I will forgo showing the Go written for this section. 
-
-First, I check to see if a journeyhash has not yet been seen by checking it's inclusion in a set (`journeyID`). If the following returns `1`, I proceed with creating series and rules, else, I just `TS.ADD` the data.
-
-```bash
-SADD journeyID <JOURNEYHASH>
-```
-
-The first series is created with the following command. For the remainder of this section, I'll refer to these as **Time Series A**
-
-```bash
-127.0.0.1:6379>  TS.CREATE positions:<JOURNEYHASH>:speed
-127.0.0.1:6379>  TS.CREATE positions:<JOURNEYHASH>:gh
-```
-
-The aggregation series are fed by the "main" timeseries and created with the command below. I'll refer to these as **Time Series B**
-
-```bash
-127.0.0.1:6379>  TS.CREATE positions:<JOURNEYHASH>:speed:agg RETENTION 7200000 LABELS speed 1 journey <JOURNEYHASH>
-127.0.0.1:6379>  TS.CREATE positions:<JOURNEYHASH>:gh:agg RETENTION 7200000 LABELS gh 1 journey <JOURNEYHASH>
-```
-
-For the rule that governs **Time Series A** -> **Time Series B**, I use the following command:
-
-```bash
-127.0.0.1:6379> TS.CREATERULE positions:<JOURNEYHASH>:speed positions:<JOURNEYHASH>:speed:agg AGGREGATION LAST 150000
-127.0.0.1:6379> TS.CREATERULE positions:<JOURNEYHASH>:gh positions:<JOURNEYHASH>:gh:agg AGGREGATION LAST 150000
-```
-
-To add data to **Time Series A** I use the following:
-
-```bash
-127.0.0.1:6379> TS.ADD positions:<JOURNEYHASH>:speed * 10 RETENTION 60000 CHUNK_SIZE 16 ON_DUPLICATE LAST
-127.0.0.1:6379> TS.ADD positions:<JOURNEYHASH>:gh * 123456123456163 RETENTION 60000 ON_DUPLICATE LAST
-```
-
-In the example above, `123456123456163` is a fake number which represents a integer encoding of a geohash coordinate to integer encoding was handled in Go with [this](https://pkg.go.dev/github.com/mmcloughlin/geohash@v0.10.0) package.
-
-### Redis Gears
-
-I use a Docker image that is almost identical to `redislabs/redismod:latest` (see: [Dockerfile](/redis/Dockerfile)) as the base image for this project. The only significant difference is that this container contains a RedisGears function which implements a write-behind pattern.
-
-This function consumes from a stream and writes data to PostgreSQL/PostGIS every 5s/10,000 events. Even though Gears runs off the main thread, this function is designed to do minimal data-processing. This function simply dumps MQTT event data into PostGIS and allows the PostGIS and `Tilegen` processes to transform these events to MBtiles.
-
-The RedisGears function is written in Python and doesn't call any Redis commands; See [function](/redis/stream_writebehind.py).
-
-### Tile Generation Pipeline (PostGIS)
-
-The `PostGIS` and `Tilegen` containers are crucial in serving **GTFS** and  **current traffic** layers.
-
-PostGIS is a PostgreSQL extension that enables geospatial operations.
-
-TileGen is an alpine container that contains two common utilities used in geospatial processing, `GDAL` and `tippecanoe` (and `psql`, the PostgreSQL client). This container is required for:
-
-1. [Sourcing static data](tilegen/tippecanoe/get_static_data.sh) and pushing it to PostGIS with [GDAL](https://gdal.org/)
-2. Periodic [regeneration of tiles](/tilegen/tippecanoe/tilegen.sh) using [Tippecanoe](https://github.com/mapbox/tippecanoe)
-
-The TilesAPI is a  simple Golang API which is used to fetch those tiles from disk and send them to the frontend.
-
-### Accessing Data with the Locations API
-
-The Locations API has two endpoints `/locations/` and `/histlocations/`.
-
-- `/locations/` subscribes to the Redis PUB/SUB channel described earlier. When a client connects to this endpoint, the connection is upgraded and events are pushed along to the client in real-time.
-  
-- `/histlocations/` queries a specific trip timeseries in Redis using `TS.MRANGE`; the API takes the "merged" result and creates a response of historical positions and speeds for a given trip.
-
-#### Commands
-
-The `/locations/` endpoint subscribes/reads data from the PUB/SUB channel defined in the MQTT broker section. While written in Go, the redis-cli command for this would be:
-
-```bash
-127.0.0.1:6379> SUBSCRIBE currentLocationsPS
-```
-
-The `/histlocations/` endpoint needs to gather data from multiple time series to create a combined response for the client, this means making a `TS.MRANGE` call. Because each **Timeseries B** is labelled with it's journey hash, the `TS.MRANGE` gathers the position and speed stats with a single call, filtering on journey hash.
-
-```bash
-127.0.0.1:6379> TS.MRANGE - + FILTER journey=<JOURNEYHASH>
-```
-
-### Frontend
-
-The frontend uses [OpenLayers](https://openlayers.org/), a JS library, to create a map and display the layers created by the previously described services. In production, this is served using Nginx rather than Parcel's development mode.
-
-The frontend also makes calls to a publicly available [API](https://carto.com/help/building-maps/basemap-list/) for basemap imagery.
-
-------
-
-## Technical Appendix
-
-### Data Throughput
-
-This system is not explicitly architected to handle huge amounts of data, but it does perform acceptably given this (relatively small scale) task. Anecdotally, the system processes ~15GB of messages per day when subscribed to the MQTT topic corresponding to all bus position updates.
-
-The following charts display the rise in event throughput on a Sunday morning into afternoon and evening. Notice that towards the middle of the day the events/second top out at 500/s (30k events/min shown on graph) after growing steadily from < 10 events/s (1k events/minute) early in the morning.
-
-![Events](https://raw.githubusercontent.com/DMW2151/expert-garbanzo/master/docs/events_epm_iii.png "epm")
-
-![Events](https://raw.githubusercontent.com/DMW2151/expert-garbanzo/master/docs/events_per_min.png "epm")
-
-Alternatively, on a weekday morning at 8:00am, we can see the system handling ~1600+ events/s relatively comfortably. Consider the following stats from a five minute window the morning of 5/14/2021.
-
-```sql
-select
-    now(), -- UTC
-    count(1)/300 as eps -- averaged over prev 300s
-from statistics.events
-where approx_event_time > now() - interval'5 minute';
-
-
-              now              | eps
--------------------------------+------
- 2021-05-14 05:06:28.974982+00 | 1646
-```
-
-### Memory, CPU, and Disk Usage
-
-In local testing, I found the most stressed part of the system wasn't CPU as I had originally suspected, but instead the disk. See the capture below for the `docker stats` from 8:00am 5/14/2021.
-
-```bash
-CONTAINER ID   NAME                     CPU %     MEM USAGE / LIMIT     MEM %     NET I/O
-6d0a1d7fab0d   redis_hackathon_mqtt_1   24.02%    10.71MiB / 3.786GiB   0.28%     32GB / 60.4GB  
-833aab4d39a8   redis_hackathon_redis_1  7.02%     862.7MiB / 3.786GiB   22.26%    58.8GB / 38.9GB
-```
-
-
-Upgrading from AWS standard `gp2` EBS to `gp3` EBS allowed me to get 3000 IOPs and 125MB/s throughput essentially for free and made hosting the PostgreSQL instance in a container viable. Without a robust disk, the site still functioned, however tile generation was quite slow and could lag 10+ minutes. As I'd like to expand this component to allow for 30m, 1h, 2h, 6h traffic layers, being able to get historical positions from disk quickly was crucial.
-
-Prior to upgrade, system load was very high due to the write-behind from gears (writing to disk) and tile generation (from disk). With the update, even during rush-hour (decoding/encoding messages -> CPU Heavy) and tile regeneration (Both Disk & CPU heavy), `%iowait` stays low and system load stays < 1. Consider the following results from `sar` during a tile regeneration event
-
-```bash
-                CPU     %user   %system   %iowait   %idle  
-20:00:07        all      9.98      9.88     47.08   32.56
-# PostgreSQL Aggregations - Disk Heavy --
-20:00:22        all     10.22     12.04     41.70   35.22
-20:00:37        all     10.46     10.66     61.73   16.95
-20:00:52        all     34.89     11.97     34.48   18.56
-20:01:07        all      8.00      8.51     55.59   26.97
-# Tilegeneration - User Heavy --
-20:01:22        all     32.93      8.13     26.42   32.42
-20:01:37        all     48.94     10.90     21.29   18.87
-# Back to High Idle % --
-20:01:47        all      7.19      4.39      5.89   81.24
-```
-
-Due to the time series policy which sets TTL on entries for 1m in series A / 2h in series B and the Gears function constantly clearing the event stream, the Redis memory usage stays fairly constant around 800-900MB.
-
-------
+- [ ] MQTT username/password per vehicle (`mosquitto.conf` `password_file`)
+- [ ] TLS on port 8883 (Let's Encrypt / stunnel)
+- [ ] SOS button → `trucks/{vid}/sos` emergency topic
+- [ ] JWT auth on WebSocket API
+- [ ] Geofence alerts via Redis TimeSeries rules

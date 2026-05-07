@@ -1,4 +1,4 @@
-package hsldatabridge
+package fleetbridge
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"os"
 	"strconv"
 
-	redis "github.com/go-redis/redis/v8"
+	redis "github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
 
