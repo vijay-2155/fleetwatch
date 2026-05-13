@@ -18,4 +18,4 @@ COPY ./index.html /usr/share/nginx/html/index.html
 COPY ./nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 8080
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["sh", "-c", "mkdir -p /usr/share/nginx/html/cdn && printf '{\"version\":1,\"mqtt\":{\"host\":\"%s\",\"port\":%s,\"protocol\":\"tcp\"}}\n' \"${PUBLIC_MQTT_HOST:-localhost}\" \"${PUBLIC_MQTT_PORT:-1883}\" > /usr/share/nginx/html/cdn/fleet-config.json && nginx -g 'daemon off;'"]

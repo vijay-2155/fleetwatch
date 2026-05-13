@@ -29,14 +29,28 @@ Production-grade GPS tracking platform for Indian logistics fleets.
 
 ### Prerequisites
 - Docker + Docker Compose v2
-- Android phone on same Wi-Fi as server (for live test)
+- Android phone with network access to the public MQTT endpoint
 
-### 1. Configure your LAN IP
+### 1. Configure Mobile Discovery
 
-```dart
-// driver_app/lib/config.dart
-static const mqttHost = '192.168.x.x';   // ← your machine's LAN IP
+Set the public broker address that phones can reach. This can be a VPS IP,
+domain, or TCP tunnel host.
+
+```bash
+# envs/hslweb.env
+PUBLIC_MQTT_HOST=mqtt.example.com
+PUBLIC_MQTT_PORT=1883
 ```
+
+The frontend container writes this into:
+
+```text
+http://your-server:8080/cdn/fleet-config.json
+```
+
+Build the driver app with `FLEET_CONFIG_URL` pointed at that stable URL. If the
+server IP changes later, update `PUBLIC_MQTT_HOST` and restart the frontend
+container; the APK does not need to be rebuilt.
 
 ### 2. Start backend services
 
