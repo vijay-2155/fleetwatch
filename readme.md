@@ -52,6 +52,16 @@ Build the driver app with `FLEET_CONFIG_URL` pointed at that stable URL. If the
 server IP changes later, update `PUBLIC_MQTT_HOST` and restart the frontend
 container; the APK does not need to be rebuilt.
 
+For local dev without a domain, run the one-command ngrok flow:
+
+```bash
+./tools/dev_mobile_tunnel.sh
+```
+
+It starts Docker services, opens an ngrok TCP tunnel for MQTT, updates
+`envs/hslweb.env`, recreates the frontend discovery JSON, and runs the Flutter
+driver app with the correct `FLEET_CONFIG_URL`.
+
 ### 2. Start backend services
 
 ```bash
