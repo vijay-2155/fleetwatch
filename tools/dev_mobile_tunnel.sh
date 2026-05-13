@@ -11,6 +11,7 @@ MQTT_PORT="${MQTT_PORT:-1883}"
 FRONTEND_PORT="${FRONTEND_PORT:-8080}"
 RUN_FLUTTER="${RUN_FLUTTER:-1}"
 SKIP_PUB_GET="${SKIP_PUB_GET:-0}"
+TUNNEL_MODE="${TUNNEL_MODE:-auto}" # auto, ngrok, or lan
 
 log() {
   printf '\033[1;34m[dev-tunnel]\033[0m %s\n' "$*"
@@ -23,6 +24,10 @@ fail() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
+}
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
 }
 
 detect_lan_ip() {
@@ -82,7 +87,7 @@ write_hslweb_env() {
   {
     printf '\n'
     printf '# Public MQTT endpoint written into /cdn/fleet-config.json by the frontend\n'
-    printf '# container. Dev script updates this from the ngrok TCP tunnel.\n'
+    printf '# container. Dev script updates this from ngrok or LAN mode.\n'
     printf 'PUBLIC_MQTT_HOST=%s\n' "$mqtt_host"
     printf 'PUBLIC_MQTT_PORT=%s\n' "$mqtt_port"
   } >> "$tmp_file"
@@ -102,8 +107,16 @@ trap cleanup EXIT INT TERM
 cd "$ROOT_DIR"
 
 require_cmd docker
-require_cmd "$NGROK_BIN"
 require_cmd python3
+
+case "$TUNNEL_MODE" in
+  auto|ngrok|lan) ;;
+  *) fail "Invalid TUNNEL_MODE=$TUNNEL_MODE. Use auto, ngrok, or lan." ;;
+esac
+
+if [ "$TUNNEL_MODE" = "ngrok" ]; then
+  require_cmd "$NGROK_BIN"
+fi
 
 if [ "$RUN_FLUTTER" = "1" ]; then
   require_cmd flutter
@@ -118,20 +131,38 @@ CONFIG_URL="${CONFIG_URL:-http://$CONFIG_HOST:$FRONTEND_PORT/cdn/fleet-config.js
 log "Starting backend services"
 docker compose up -d mosquitto redis mqtt locations_api
 
-log "Opening ngrok TCP tunnel to local MQTT port $MQTT_PORT"
-"$NGROK_BIN" tcp "$MQTT_PORT" --log=stdout > /tmp/fleetwatch-ngrok.log 2>&1 &
-NGROK_PID="$!"
+PUBLIC_MQTT_HOST="$CONFIG_HOST"
+PUBLIC_MQTT_PORT="$MQTT_PORT"
+USING_TUNNEL="lan"
 
-PUBLIC_URL="$(wait_for_ngrok_tcp_url)" || {
-  sed -n '1,120p' /tmp/fleetwatch-ngrok.log >&2 || true
-  fail "Could not read ngrok TCP URL. Check ngrok auth/payment setup."
-}
+if [ "$TUNNEL_MODE" != "lan" ] && has_cmd "$NGROK_BIN"; then
+  log "Opening ngrok TCP tunnel to local MQTT port $MQTT_PORT"
+  "$NGROK_BIN" tcp "$MQTT_PORT" --log=stdout > /tmp/fleetwatch-ngrok.log 2>&1 &
+  NGROK_PID="$!"
 
-PUBLIC_URL="${PUBLIC_URL#tcp://}"
-PUBLIC_MQTT_HOST="${PUBLIC_URL%:*}"
-PUBLIC_MQTT_PORT="${PUBLIC_URL##*:}"
+  if PUBLIC_URL="$(wait_for_ngrok_tcp_url)"; then
+    PUBLIC_URL="${PUBLIC_URL#tcp://}"
+    PUBLIC_MQTT_HOST="${PUBLIC_URL%:*}"
+    PUBLIC_MQTT_PORT="${PUBLIC_URL##*:}"
+    USING_TUNNEL="ngrok"
+  else
+    sed -n '1,120p' /tmp/fleetwatch-ngrok.log >&2 || true
+    if [ "$TUNNEL_MODE" = "ngrok" ]; then
+      fail "Could not read ngrok TCP URL. ngrok TCP may require account verification."
+    fi
 
-log "MQTT tunnel: $PUBLIC_MQTT_HOST:$PUBLIC_MQTT_PORT"
+    log "ngrok TCP unavailable; falling back to LAN mode."
+    log "Phone must be on the same Wi-Fi/network as this machine."
+    cleanup
+    unset NGROK_PID
+  fi
+elif [ "$TUNNEL_MODE" = "ngrok" ]; then
+  fail "Missing command: $NGROK_BIN"
+else
+  log "Using LAN mode. Phone must be on the same Wi-Fi/network as this machine."
+fi
+
+log "MQTT endpoint ($USING_TUNNEL): $PUBLIC_MQTT_HOST:$PUBLIC_MQTT_PORT"
 log "Writing envs/hslweb.env"
 write_hslweb_env "$PUBLIC_MQTT_HOST" "$PUBLIC_MQTT_PORT"
 
@@ -152,8 +183,13 @@ except Exception as exc:
 PY
 
 if [ "$RUN_FLUTTER" != "1" ]; then
-  log "RUN_FLUTTER=0 set, leaving backend and tunnel running until this script exits."
-  wait "$NGROK_PID"
+  if [ "$USING_TUNNEL" = "ngrok" ]; then
+    log "RUN_FLUTTER=0 set, leaving backend and tunnel running until this script exits."
+    wait "$NGROK_PID"
+  else
+    log "RUN_FLUTTER=0 set, backend is ready in LAN mode."
+    log "Press Ctrl+C when done if you want this script to return now."
+  fi
   exit 0
 fi
 
