@@ -397,18 +397,20 @@ const osmLayer = new ol.layer.Tile({
 });
 
 // Live vehicle dots
-const liveSource = new ol.source.Vector();
-const liveLayer  = new ol.layer.Vector({
-  source: liveSource,
-  style: vehicleStyle,
-});
+const liveSource  = new ol.source.Vector();
+const liveLayer   = new ol.layer.Vector({ source: liveSource, style: vehicleStyle });
 
 // Trail (breadcrumb) layer
 const trailSource = new ol.source.Vector();
-const trailLayer  = new ol.layer.Vector({
-  source: trailSource,
-  visible: false,
-  style: trailStyle,
+const trailLayer  = new ol.layer.Vector({ source: trailSource, visible: false, style: trailStyle });
+
+// Route polyline layer — drawn when simulator publishes route geometry
+const routeSource = new ol.source.Vector();
+const routeLayer  = new ol.layer.Vector({
+  source: routeSource,
+  style: new ol.style.Style({
+    stroke: new ol.style.Stroke({ color: '#f97316', width: 4, lineDash: [10, 6] }),
+  }),
 });
 
 function vehicleStyle(feature) {
@@ -445,7 +447,7 @@ function trailStyle() {
 
 const map = new ol.Map({
   target: 'map',
-  layers: [osmLayer, trailLayer, liveLayer],
+  layers: [osmLayer, routeLayer, trailLayer, liveLayer],
   view: new ol.View({
     // Default: centre of India
     center: ol.proj.fromLonLat([78.9629, 20.5937]),
@@ -538,8 +540,10 @@ function connectWS() {
   ws.onmessage = (e) => {
     try {
       const raw = JSON.parse(e.data);
-      // Go worker publishes the raw TruckEvent JSON
-      const ev  = raw.VP ?? raw;   // support both wrapped and direct
+      // Route geometry message from simulator
+      if (raw.type === 'route') { drawRoute(raw); return; }
+      // Normal truck position — support both wrapped {VP:{}} and direct {}
+      const ev = raw.VP ?? raw;
       onEvent(ev);
     } catch (err) {
       console.warn('WS parse error', err);
@@ -552,12 +556,34 @@ function connectWS() {
   };
 }
 
+// ── Route drawing ────────────────────────────────────────────────────────────
+const _drawnRoutes = new Set();
+function drawRoute(msg) {
+  if (_drawnRoutes.has(msg.id)) return;  // draw once per route id
+  _drawnRoutes.add(msg.id);
+
+  // msg.coords is [[lng, lat], ...] — convert to OL coordinates
+  const olCoords = msg.coords.map(c => ol.proj.fromLonLat(c));
+  const line     = new ol.geom.LineString(olCoords);
+  const feat     = new ol.Feature({ geometry: line });
+
+  if (msg.color) {
+    feat.setStyle(new ol.style.Style({
+      stroke: new ol.style.Stroke({ color: msg.color, width: 4, lineDash: [10, 6] }),
+    }));
+  }
+
+  routeSource.addFeature(feat);
+
+  // Fly to the route extent
+  map.getView().fit(line.getExtent(), { padding: [60, 60, 60, 60], duration: 900 });
+  console.log(`Route drawn: ${msg.name}`);
+}
+
 function onEvent(ev) {
-  if (!ev || !ev.lat || !ev.lng) return;
+  if (!ev || ev.lat == null || ev.lng == null) return;
 
   totalEvents++;
-
-  // Update stats
   vehicles.set(ev.vid, ev);
   document.getElementById('stat-events').textContent   = totalEvents;
   document.getElementById('stat-vehicles').textContent = vehicles.size;
@@ -565,7 +591,6 @@ function onEvent(ev) {
   document.getElementById('stat-speed').innerHTML =
     `${(ev.spd||0).toFixed(1)} <span style="font-size:.9rem;color:var(--muted)">km/h</span>`;
 
-  // Move/add map feature
   const coord = ol.proj.fromLonLat([ev.lng, ev.lat]);
   let feat = liveSource.getFeatureById(ev.vid);
   if (feat) {
@@ -578,16 +603,12 @@ function onEvent(ev) {
     liveSource.addFeature(feat);
   }
 
-  // Trail breadcrumb
-  trailPts.push(ev);
-  if (trailPts.length > 200) trailPts.shift();
   const trailFeat = new ol.Feature({ geometry: new ol.geom.Point(coord) });
   trailSource.addFeature(trailFeat);
   if (trailSource.getFeatures().length > 200) {
     trailSource.removeFeature(trailSource.getFeatures()[0]);
   }
 
-  // Auto-pan to first vehicle
   if (totalEvents === 1) {
     map.getView().animate({ center: coord, zoom: 14, duration: 800 });
   }
@@ -597,15 +618,13 @@ function onEvent(ev) {
 
 // ── Event feed (sidebar) ──────────────────────────────────────────────────────
 function addFeedRow(ev) {
-  const feed = document.getElementById('feed');
+  const feed  = document.getElementById('feed');
   const noMsg = document.getElementById('no-events');
   if (noMsg) noMsg.remove();
 
-  const spd = ev.spd || 0;
+  const spd      = ev.spd || 0;
   const spdClass = spd > 80 ? 'spd-hi' : spd > 40 ? 'spd-mid' : 'spd-ok';
-
-  const now = new Date();
-  const timeStr = now.toTimeString().slice(0,8);
+  const timeStr  = new Date().toTimeString().slice(0, 8);
 
   const row = document.createElement('div');
   row.className = 'evt';
@@ -622,28 +641,22 @@ function addFeedRow(ev) {
       <div class="chip"><span class="k">bat</span><span class="v">${ev.bat ?? '?'}%</span></div>
     </div>`;
 
-  // Click to pan
   row.addEventListener('click', () => {
-    const coord = ol.proj.fromLonLat([ev.lng, ev.lat]);
-    map.getView().animate({ center: coord, zoom: 15, duration: 600 });
-    // highlight briefly
+    const c = ol.proj.fromLonLat([ev.lng, ev.lat]);
+    map.getView().animate({ center: c, zoom: 15, duration: 600 });
     document.querySelectorAll('.evt.selected').forEach(r => r.classList.remove('selected'));
     row.classList.add('selected');
   });
 
   feed.insertBefore(row, feed.firstChild);
-
-  // Flash
   row.classList.add('flash');
   setTimeout(() => row.classList.remove('flash'), 600);
-
-  // DOM cap
   while (feed.children.length > 60) feed.removeChild(feed.lastChild);
 }
 
 function clearFeed() {
-  const feed = document.getElementById('feed');
-  feed.innerHTML = '<div class="no-events" id="no-events"><div class="big">📭</div>Cleared</div>';
+  document.getElementById('feed').innerHTML =
+    '<div class="no-events" id="no-events"><div class="big">📭</div>Cleared</div>';
   totalEvents = 0;
   vehicles.clear();
   trailSource.clear();
@@ -651,7 +664,8 @@ function clearFeed() {
   document.getElementById('stat-events').textContent   = '0';
   document.getElementById('stat-vehicles').textContent = '0';
   document.getElementById('stat-vid').textContent      = '—';
-  document.getElementById('stat-speed').innerHTML      = '— <span style="font-size:.9rem;color:var(--muted)">km/h</span>';
+  document.getElementById('stat-speed').innerHTML =
+    '— <span style="font-size:.9rem;color:var(--muted)">km/h</span>';
 }
 
 // ── Badge ─────────────────────────────────────────────────────────────────────
@@ -659,14 +673,16 @@ function setBadge(online) {
   const b  = document.getElementById('ws-badge');
   const d  = document.getElementById('ws-dot');
   const lb = document.getElementById('ws-label');
-  b.className  = 'online' in b.classList ? '' : '';
-  b.className  = online ? 'online' : 'offline';
-  d.className  = online ? 'dot pulse' : 'dot';
+  b.className    = online ? 'online' : 'offline';
+  d.className    = online ? 'dot pulse' : 'dot';
   lb.textContent = online ? 'Live' : 'Reconnecting…';
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectWS();
+
+// ── Demo Mode: Vizag Port → Kakinada Port ─────────────────────────────────────
+
 </script>
 </body>
 </html>
