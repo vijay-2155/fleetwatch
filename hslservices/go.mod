@@ -4,9 +4,12 @@ go 1.22
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.0
+	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/lib/pq v1.10.9
 	github.com/mmcloughlin/geohash v0.10.0
+	github.com/paulmach/orb v0.11.0
 	github.com/redis/go-redis/v9 v9.7.3
 	github.com/sirupsen/logrus v1.9.4
 	golang.org/x/sync v0.10.0

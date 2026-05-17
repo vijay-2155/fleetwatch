@@ -31,6 +31,6 @@ COPY ./tippecanoe /
 
 RUN crontab crontab.txt
 
-RUN chmod 755 /tilegen.sh /get_static_data.sh /docker-entrypoint.sh
+RUN chmod 755 /tilegen.sh /get_static_data.sh /docker-entrypoint.sh /generate_port.sh
 
 CMD './docker-entrypoint.sh'

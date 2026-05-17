@@ -13,10 +13,10 @@ import (
 	"syscall"
 
 	fleet "github.com/dmw2151/fleetbridge"
-	"github.com/redis/go-redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/mmcloughlin/geohash"
+	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
 )
@@ -266,6 +266,9 @@ func (lh *LocationsAPIHandler) historicallocationsHandler(w http.ResponseWriter,
 
 func init() {
 
+	// Wire os.Getenv into the trips.go helper so it can read PG_DSN.
+	osGetenv = os.Getenv
+
 	// Set Logging Config
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.DebugLevel)
@@ -274,6 +277,9 @@ func init() {
 		DisableColors:   true,
 		TimestampFormat: "2006-01-02 15:04:05.0000",
 	})
+
+	// Initialise the Port Map PostGIS connection.
+	initPortDB()
 
 	// Initialize the LocationsAPI Handler & Have It Subscribe
 	// to Target Topics
@@ -294,6 +300,9 @@ func main() {
 
 	// Historical Locations Endpoint...
 	router.HandleFunc("/histlocations/", apiHandler.historicallocationsHandler)
+
+	// Port Map Endpoints (berths, yards, corridors, gates, trip assignment)
+	RegisterPortMapRoutes(router)
 
 	log.Fatal(
 		http.ListenAndServe(":2152", router),

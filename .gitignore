@@ -2,6 +2,6 @@
 /frontend/.cache/
 /frontend/node_modules/
 /frontend/dist/
-/deploy/**
+/frontend/
 /driver_app/
-
+/deploy/**

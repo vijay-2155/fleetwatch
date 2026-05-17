@@ -1,7 +1,12 @@
 package main
 
+// =============================================================================
+// main.go  (updated — adds geofence engine startup + CheckEvent per event)
+// =============================================================================
+
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
@@ -9,8 +14,9 @@ import (
 	"syscall"
 
 	fleet "github.com/dmw2151/fleetbridge"
-	redis "github.com/redis/go-redis/v9"
+	_ "github.com/lib/pq"
 	"github.com/mmcloughlin/geohash"
+	redis "github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -20,7 +26,41 @@ var (
 	_           = fleet.InitMQTTClient(msgBroker)
 	redisClient = fleet.InitRedisClient(ctx)
 	nWorkers    = 10
+
+	// geofence is initialised in main() after DB connection is ready.
+	// Workers call CheckEvent; nil check guards the pre-init window.
+	geofence *GeofenceEngine
 )
+
+// openPostGIS opens a connection to the PostGIS database using environment
+// variables that match those injected by docker-compose (postgres.env).
+func openPostGIS() (*sql.DB, error) {
+	host := getenv("POSTGRES_HOST", "postgis")
+	port := getenv("POSTGRES_PORT", "5432")
+	user := getenv("POSTGRES_USER", "postgres")
+	pass := getenv("POSTGRES_PASSWORD", "pass")
+	dbname := getenv("POSTGRES_DB", "fleet")
+
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, pass, dbname,
+	)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping postgis: %w", err)
+	}
+	return db, nil
+}
+
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // statTripID checks if a tripKey already has a time-series in Redis.
 // Returns true if it already exists (SADD returned 0 = element was present).
@@ -71,6 +111,7 @@ func createTimeSeriesPair(client *redis.Client, tripKey string, label string) {
 //  1. PUBLISH to "currentLocationsPS" (WebSocket dashboard fan-out)
 //  2. XADD to "events" stream (write-behind to PostGIS via RedisGears)
 //  3. TS.ADD speed and geohash time-series (last 60 s for history API)
+//  4. GeofenceEngine.CheckEvent — four in-memory geofence checks
 func writeRedis(ctx context.Context, C <-chan []byte, client *redis.Client) {
 	for msg := range C {
 
@@ -153,6 +194,11 @@ func writeRedis(ctx context.Context, C <-chan []byte, client *redis.Client) {
 				"Speed":   v.Speed,
 			}).Debug("Event written")
 		}
+
+		// 4. Geofence checks (in-memory, zero DB hits)
+		if geofence != nil {
+			geofence.CheckEvent(v.VehicleID, v.Lat, v.Lng, v.Speed, v.Timestamp)
+		}
 	}
 }
 
@@ -165,13 +211,26 @@ func init() {
 func main() {
 	defer cancel()
 
-	quitChannel := make(chan os.Signal, 1)
+	// ── Connect to PostGIS and start geofence engine ──────────────────────────
+	db, err := openPostGIS()
+	if err != nil {
+		log.Warnf("geofence: PostGIS unavailable (%v) — geofence disabled", err)
+	} else {
+		gf, err := NewGeofenceEngine(ctx, db, redisClient)
+		if err != nil {
+			log.Warnf("geofence: engine init failed (%v) — geofence disabled", err)
+		} else {
+			geofence = gf
+			log.Info("geofence: engine started")
+		}
+	}
 
-	// Drain staging channel with N concurrent Redis writers
+	// ── Drain staging channel with N concurrent Redis writers ─────────────────
 	for i := 0; i < nWorkers; i++ {
 		go writeRedis(ctx, msgBroker.StagingC, redisClient)
 	}
 
+	quitChannel := make(chan os.Signal, 1)
 	signal.Notify(quitChannel, syscall.SIGINT, syscall.SIGTERM)
 	<-quitChannel
 	log.Info("Fleet Go Worker — shutting down")
