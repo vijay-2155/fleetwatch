@@ -301,6 +301,10 @@ func main() {
 	// Historical Locations Endpoint...
 	router.HandleFunc("/histlocations/", apiHandler.historicallocationsHandler)
 
+	// GEO Endpoints — live fleet spatial queries
+	router.HandleFunc("/fleet/current/", apiHandler.currentFleetHandler)
+	router.HandleFunc("/fleet/nearby/", apiHandler.nearbyFleetHandler)
+
 	// Port Map Endpoints (berths, yards, corridors, gates, trip assignment)
 	RegisterPortMapRoutes(router)
 

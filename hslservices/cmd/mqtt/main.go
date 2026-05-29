@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	fleet "github.com/dmw2151/fleetbridge"
 	_ "github.com/lib/pq"
@@ -110,8 +111,10 @@ func createTimeSeriesPair(client *redis.Client, tripKey string, label string) {
 //
 //  1. PUBLISH to "currentLocationsPS" (WebSocket dashboard fan-out)
 //  2. XADD to "events" stream (write-behind to PostGIS via RedisGears)
-//  3. TS.ADD speed and geohash time-series (last 60 s for history API)
-//  4. GeofenceEngine.CheckEvent — four in-memory geofence checks
+//  3. TS.ADD speed and geohash time-series (60 s rolling)
+//  4. GEOADD fleet:live — spatial index for GEOSEARCH radius queries
+//  5. HSET truck:{vid} + EXPIRE 5 min — current state, liveness TTL
+//  6. GeofenceEngine.CheckEvent — four in-memory geofence checks
 func writeRedis(ctx context.Context, C <-chan []byte, client *redis.Client) {
 	for msg := range C {
 
@@ -182,6 +185,29 @@ func writeRedis(ctx context.Context, C <-chan []byte, client *redis.Client) {
 			"ON_DUPLICATE", "LAST",
 		)
 
+		// 4. GEO: spatial index — powers GEOSEARCH radius queries
+		pipe.GeoAdd(ctx, "fleet:live", &redis.GeoLocation{
+			Name:      v.VehicleID,
+			Longitude: v.Lng,
+			Latitude:  v.Lat,
+		})
+
+		// 5. Hash: current truck state with 5-min TTL
+		//    Expired hash = truck offline. GEOSEARCH filters offline trucks
+		//    by checking whether truck:{vid} still exists after the GEO lookup.
+		truckKey := fmt.Sprintf("truck:%s", v.VehicleID)
+		pipe.HSet(ctx, truckKey,
+			"lat", v.Lat,
+			"lng", v.Lng,
+			"spd", v.Speed,
+			"brg", v.Bearing,
+			"ts", v.Timestamp,
+			"bat", v.Battery,
+			"tid", v.TripID,
+			"did", v.DriverID,
+		)
+		pipe.Expire(ctx, truckKey, 5*time.Minute)
+
 		if _, err := pipe.Exec(ctx); err != nil {
 			if netErr, ok := err.(net.Error); ok {
 				log.Errorf("Redis network error: %+v", netErr)
@@ -195,7 +221,7 @@ func writeRedis(ctx context.Context, C <-chan []byte, client *redis.Client) {
 			}).Debug("Event written")
 		}
 
-		// 4. Geofence checks (in-memory, zero DB hits)
+		// 6. Geofence checks (in-memory, zero DB hits)
 		if geofence != nil {
 			geofence.CheckEvent(v.VehicleID, v.Lat, v.Lng, v.Speed, v.Timestamp)
 		}
@@ -211,6 +237,14 @@ func init() {
 func main() {
 	defer cancel()
 
+	// ── Drain staging channel with N concurrent Redis writers ─────────────────
+	// Start writers before geofence loading so telemetry ingestion is not
+	// blocked by spatial reference data startup.
+	for i := 0; i < nWorkers; i++ {
+		go writeRedis(ctx, msgBroker.StagingC, redisClient)
+	}
+	log.WithField("Workers", nWorkers).Info("Redis writer pool started")
+
 	// ── Connect to PostGIS and start geofence engine ──────────────────────────
 	db, err := openPostGIS()
 	if err != nil {
@@ -223,11 +257,6 @@ func main() {
 			geofence = gf
 			log.Info("geofence: engine started")
 		}
-	}
-
-	// ── Drain staging channel with N concurrent Redis writers ─────────────────
-	for i := 0; i < nWorkers; i++ {
-		go writeRedis(ctx, msgBroker.StagingC, redisClient)
 	}
 
 	quitChannel := make(chan os.Signal, 1)

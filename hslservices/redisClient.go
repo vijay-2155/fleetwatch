@@ -46,7 +46,7 @@ func InitRedisClient(ctx context.Context) *redis.Client {
 	if err != nil {
 		log.WithFields(log.Fields{
 			"Addr": fmt.Sprintf("%s:%s", redisHost, redisPort),
-		}).Errorf("Invalid Redis DB (%s): %s", redisDB, err)
+		}).Errorf("Redis connection failed: %s", err)
 		log.Panicln(err)
 	}
 

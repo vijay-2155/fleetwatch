@@ -49,7 +49,7 @@ func (e *TruckEvent) GetEventHash() string {
 	io.WriteString(h, fmt.Sprintf("%s:%s", e.VehicleID, e.TripID))
 	tripKey := fmt.Sprintf("%x", h.Sum(nil))
 
-	log.Infof("trip_key vehicle=%s trip=%s hash=%s", e.VehicleID, e.TripID, tripKey)
+	log.Debugf("trip_key vehicle=%s trip=%s hash=%s", e.VehicleID, e.TripID, tripKey)
 	return tripKey
 }
 
