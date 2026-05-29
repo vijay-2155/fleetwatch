@@ -1,75 +1,31 @@
-# 🚛 FleetTrack India — Real-Time Truck & Fleet Tracking
+# FleetTrack India — Backend Infrastructure
 
-Production-grade GPS tracking platform for Indian logistics fleets.  
-**Driver Flutter app → Mosquitto MQTT → Go worker → Redis Stack → PostGIS → OpenStreetMap dashboard**
-
----
-
-## Architecture
+Real-time GPS tracking and geofencing backend for Visakhapatnam Port bulk-cargo logistics.
 
 ```
 [Driver Phone]
-  Flutter App (Android Foreground Service)
-  GPS → SQLite offline buffer → MQTT QoS 1
-             ↓
-  [Mosquitto Broker]  port 1883  (our own)
-             ↓
+  Flutter App → MQTT QoS 1
+        ↓
+  [EMQX Broker]  port 1883
+        ↓
   [Go Worker]  (hslservices/cmd/mqtt)
-             ↓
-  Redis Pipeline: PUBLISH + XADD + TS.ADD
-             ↓
-  PostGIS  (write-behind via RedisGears / Triggers & Functions)
-             ↓
-  WebSocket → Live OpenStreetMap Dashboard
+        ↓
+  Redis Pipeline:
+    PUBLISH → WebSocket fan-out
+    XADD    → PostGIS write-behind
+    TS.ADD  → Speed + position time-series
+    GEOADD  → fleet:live spatial index
+    HSET    → truck:{vid} state (5-min TTL)
+    Geofence checks (in-memory, zero DB hits)
+        ↓
+  [Locations API]  port 2152
+    WebSocket  → live map dashboard
+    REST       → fleet geo queries + port map
 ```
 
 ---
 
 ## Quick Start
-
-### Prerequisites
-- Docker + Docker Compose v2
-- Android phone with network access to the public MQTT endpoint
-
-### 1. Configure Mobile Discovery
-
-Set the public broker address that phones can reach. This can be a VPS IP,
-domain, or TCP tunnel host.
-
-```bash
-# envs/hslweb.env
-PUBLIC_MQTT_HOST=mqtt.example.com
-PUBLIC_MQTT_PORT=1883
-```
-
-The frontend container writes this into:
-
-```text
-http://your-server:8080/cdn/fleet-config.json
-```
-
-Build the driver app with `FLEET_CONFIG_URL` pointed at that stable URL. If the
-server IP changes later, update `PUBLIC_MQTT_HOST` and restart the frontend
-container; the APK does not need to be rebuilt.
-
-For local dev without a domain, run the one-command mobile flow:
-
-```bash
-./tools/dev_mobile_tunnel.sh
-```
-
-It starts Docker services, tries an ngrok TCP tunnel for MQTT, falls back to LAN
-mode if ngrok TCP is unavailable, updates `envs/hslweb.env`, recreates the
-frontend discovery JSON, and runs the Flutter driver app with the correct
-`FLEET_CONFIG_URL`.
-
-To skip ngrok and use LAN mode directly:
-
-```bash
-TUNNEL_MODE=lan ./tools/dev_mobile_tunnel.sh
-```
-
-### 2. Start backend services
 
 ```bash
 docker compose up -d
@@ -77,29 +33,93 @@ docker compose up -d
 
 | Service | Port | Description |
 |---|---|---|
-| **Mosquitto** | 1883 | MQTT broker (driver phones connect here) |
-| **Redis Stack** | 6379 | TimeSeries, Streams, Pub/Sub |
-| **Go Worker** | — | MQTT → Redis bridge |
-| **Locations API** | 2152 | WebSocket fan-out + trip history |
-| **PostGIS** | 5433 | Write-behind GPS event log |
-| **Dashboard** | 8080 | Live OpenStreetMap map |
+| **EMQX** | 1883 / 8083 / 18083 | MQTT broker (TCP / WS / dashboard) |
+| **Redis Stack** | 6379 | TimeSeries, Streams, GEO, Pub/Sub |
+| **Go Worker** | — | MQTT → Redis bridge + geofence engine |
+| **Locations API** | 2152 | WebSocket fan-out + REST endpoints |
+| **PostGIS** | 5433 | GPS event log + port spatial data |
+| **Martin** | 3001 | MVT vector tile server (OSM layers) |
 
-### 3. Run the Flutter driver app
+---
 
-```bash
-cd driver_app
-flutter run --release   # or install APK on a real Android device
-```
-
-### 4. Open the dashboard
+## Project Structure
 
 ```
-http://localhost:8080
+.
+├── hslservices/              # Go backend (package: fleetbridge)
+│   ├── event.go              # TruckEvent payload model
+│   ├── mqttClient.go         # EMQX subscriber (auto-reconnect, re-subscribe)
+│   ├── redisClient.go        # Redis Stack client (go-redis v9)
+│   ├── errors.go
+│   └── cmd/
+│       ├── mqtt/
+│       │   ├── main.go       # MQTT → Redis pipeline (6-step TxPipeline)
+│       │   └── geofence.go   # In-memory geofence engine (PostGIS + GEOSEARCH)
+│       └── locations/
+│           ├── main.go       # WebSocket fan-out + router
+│           ├── geo.go        # GET /fleet/current/ · GET /fleet/nearby/
+│           └── trips.go      # Port map API (berths, yards, corridors, gates)
+│
+├── emqx/                     # EMQX broker config
+│   ├── emqx.conf
+│   └── acl.conf
+│
+├── redis/                    # Redis Stack 7.4 image + write-behind script
+├── postgis/                  # PostGIS init SQL (port schema, statistics)
+├── martin/                   # Martin MVT tile server config
+├── mock_geojson/             # Test zone data (berths, gates, corridors, yards)
+├── envs/                     # Environment variable files
+├── tools/                    # Dev utilities
+├── cargo/                    # App clients (gitignored — developed separately)
+│   ├── context/              # Flutter driver app (Android foreground service)
+│   └── frontend/             # React live map dashboard
+└── docker-compose.yml
 ```
 
 ---
 
-## Payload Format (compact keys → saves bytes on 2G/3G)
+## API Endpoints
+
+### Locations API (`:2152`)
+
+| Method | Path | Description |
+|---|---|---|
+| `WS` | `/locations/` | Live truck positions (Redis Pub/Sub fan-out) |
+| `POST` | `/histlocations/` | Trip history from Redis TimeSeries |
+| `GET` | `/fleet/current/` | All online trucks (HGETALL pipeline) |
+| `GET` | `/fleet/nearby/?lat=&lng=&radius=&unit=` | Trucks within radius (GEOSEARCH) |
+| `GET` | `/api/berths/` | Active port berths with geometry |
+| `GET` | `/api/yards/` | Active yards (`?owner_type=client\|competitor\|vpa`) |
+| `GET` | `/api/corridors/` | Active route corridors with GeoJSON polygon |
+| `GET` | `/api/gates/` | All port gates |
+| `POST` | `/api/trips/assign` | Assign truck to berth → returns corridor |
+
+### Martin Tile Server (`:3001`)
+
+| Path | Description |
+|---|---|
+| `/catalog` | Discover all tile sources |
+| `/{fn_name}/{z}/{x}/{y}` | MVT tiles (roads, railways, water, places, POI) |
+
+---
+
+## Redis Key Design
+
+| Key | Type | TTL | Description |
+|---|---|---|---|
+| `fleet:live` | GEO sorted set | none | Spatial index, all known trucks |
+| `truck:{vid}` | Hash | 5 min | Live state — lat, lng, spd, brg, ts, bat, tid, did |
+| `positions:{key}:speed` | TimeSeries | 60 s | Speed (km/h) rolling window |
+| `positions:{key}:gh` | TimeSeries | 60 s | Geohash int rolling window |
+| `positions:{key}:speed:agg` | TimeSeries | 2 h | 15 s aggregated speed |
+| `positions:{key}:gh:agg` | TimeSeries | 2 h | 15 s aggregated position |
+| `events` | Stream | — | Write-behind to PostGIS |
+| `currentLocationsPS` | Pub/Sub | — | WebSocket fan-out channel |
+| `tripKeys` | Set | — | Seen trip hashes (idempotent TS.CREATE) |
+
+---
+
+## GPS Payload Format
 
 ```json
 {
@@ -119,71 +139,12 @@ http://localhost:8080
 
 ---
 
-## Flutter App Features
-
-| Feature | Implementation |
-|---|---|
-| **Android Foreground Service** | GPS stays alive with screen off |
-| **Adaptive GPS rate** | 5 s moving · 60 s parked (saves ~80% battery) |
-| **SQLite offline buffer** | Zero data loss during highway signal blackouts |
-| **QoS 1 MQTT** | Broker ACKs every delivery |
-| **±50 m accuracy filter** | Discards tunnel / bad-fix readings |
-| **Auto-boot resume** | Restarts tracking after phone reboot |
-| **Buffer flush on reconnect** | Replays offline events when signal returns |
-
----
-
-## Project Structure
-
-```
-.
-├── driver_app/          # Flutter Android driver app
-│   └── lib/
-│       ├── config.dart               # Broker IP · GPS intervals
-│       ├── main.dart                 # App entry + dark theme
-│       ├── models/truck_event.dart   # Payload struct
-│       ├── services/
-│       │   ├── tracking_service.dart # Android Foreground Service ⭐
-│       │   ├── mqtt_service.dart     # MQTT client (QoS 1, auto-reconnect)
-│       │   └── offline_buffer.dart   # SQLite offline queue
-│       ├── providers/tracking_provider.dart
-│       └── screens/
-│           ├── home_screen.dart      # Speedometer · status · SOS
-│           └── trip_setup_screen.dart
-│
-├── hslservices/         # Go backend (renamed package: fleetbridge)
-│   ├── event.go         # TruckEvent struct
-│   ├── mqttClient.go    # Mosquitto subscriber
-│   ├── redisClient.go   # Redis Stack client (v9)
-│   ├── errors.go
-│   └── cmd/
-│       ├── mqtt/        # MQTT → Redis worker
-│       ├── locations/   # WebSocket + history API
-│       └── tiles/       # Static tile server
-│
-├── frontend/            # Live map dashboard
-│   ├── index.html       # OpenStreetMap (OpenLayers 8, CDN, no API key)
-│   ├── nginx.conf       # Proxy WS + tiles to Go services
-│   └── Dockerfile       # nginx:1.27-alpine (no npm build needed)
-│
-├── mosquitto/           # Mosquitto broker config
-│   └── mosquitto.conf
-│
-├── redis/               # Redis Stack 7.4 image + Gears scripts
-├── postgis/             # PostGIS init SQL
-├── tilegen/             # Tippecanoe tile generator (India districts)
-├── envs/                # Environment variable files
-└── docker-compose.yml
-```
-
----
-
 ## Environment Variables
 
 ### `envs/mqtt_connector.env`
 ```env
 MQTT_TOPIC=trucks/#
-MQTT_BROKER=mosquitto
+MQTT_BROKER=emqx
 MQTT_PORT=1883
 MQTT_N_WORKERS=10
 ```
@@ -195,25 +156,17 @@ REDIS_PORT=6379
 REDIS_DB=0
 ```
 
+---
+
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Driver app | Flutter 3, Android Foreground Service, SQLite |
-| MQTT broker | Eclipse Mosquitto 2 |
-| Go worker | Go 1.22, paho.mqtt v1.5, redis/go-redis v9 |
-| Cache & streams | Redis Stack 7.4 (TimeSeries, Pub/Sub, Streams) |
-| Write-behind DB | PostGIS 16-3.5 |
-| Geofence tiles | tippecanoe + GADM India boundaries |
-| Map | OpenLayers 8 + OpenStreetMap (no API key) |
-| Dashboard server | nginx 1.27 |
-
----
-
-## Security Roadmap
-
-- [ ] MQTT username/password per vehicle (`mosquitto.conf` `password_file`)
-- [ ] TLS on port 8883 (Let's Encrypt / stunnel)
-- [ ] SOS button → `trucks/{vid}/sos` emergency topic
-- [ ] JWT auth on WebSocket API
-- [ ] Geofence alerts via Redis TimeSeries rules
+| MQTT broker | EMQX 5.6.1 |
+| Go worker | Go 1.22, paho.mqtt v1.5, go-redis v9 |
+| Cache & streams | Redis Stack 7.4 (TimeSeries, GEO, Pub/Sub, Streams) |
+| Spatial DB | PostGIS 16-3.5 |
+| Geofence engine | planar.RingContains (orb) + Redis GEOSEARCH |
+| Vector tiles | Martin 0.18 + PostGIS MVT functions |
+| Driver app | Flutter 3, Android Foreground Service (cargo/context/) |
+| Dashboard | React + MapLibre GL JS (cargo/frontend/) |

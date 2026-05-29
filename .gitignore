@@ -1,6 +1,6 @@
-# ── Apps (developed separately) ──────────────────────────────────────────────
-/frontend/
-/driver_app/
+# ── Apps (developed separately, excluded from backend pushes) ─────────────────
+/cargo/frontend/
+/cargo/context/
 
 # ── Build artifacts ───────────────────────────────────────────────────────────
 /hslservices/mqtt
@@ -25,4 +25,3 @@ pyproject.toml
 # ── Misc ──────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
-test.html
